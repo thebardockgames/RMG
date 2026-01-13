@@ -29,6 +29,7 @@ bool PluginApi::Hook(m64p_dynlib_handle handle)
     HOOK_FUNC(handle, Plugin, Shutdown);
     HOOK_FUNC_OPT(handle, Plugin, Config);
     HOOK_FUNC_OPT(handle, Plugin, ConfigWithRomConfig);
+    HOOK_FUNC_OPT(handle,       , SetInitialVideoSize);
     HOOK_FUNC(handle, Plugin, GetVersion);
 
     this->handle = handle;
@@ -42,6 +43,7 @@ bool PluginApi::Unhook(void)
     UNHOOK_FUNC(Plugin, Shutdown);
     UNHOOK_FUNC(Plugin, Config);
     UNHOOK_FUNC(Plugin, ConfigWithRomConfig);
+    UNHOOK_FUNC(Plugin, SetInitialVideoSize);
     UNHOOK_FUNC(Plugin, GetVersion);
 
     this->handle = nullptr;

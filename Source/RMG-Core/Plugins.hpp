@@ -62,6 +62,9 @@ bool CorePluginsHasROMConfig(CorePluginType type);
 // used plugin of given type
 bool CorePluginsOpenROMConfig(CorePluginType type, void* parent = nullptr, std::filesystem::path file = "");
 
+// sets initial video size for the video plugin
+void CoreSetInitialVideoSize(int width, int height);
+
 // attaches all used plugins
 bool CoreAttachPlugins(void);
 

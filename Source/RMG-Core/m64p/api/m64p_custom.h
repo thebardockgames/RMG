@@ -39,6 +39,17 @@ typedef m64p_error (*ptr_PluginConfigWithRomConfig)(void*, int, CoreRomHeader*, 
 EXPORT m64p_error CALL PluginConfigWithRomConfig(void*, int, CoreRomHeader*, CoreRomSettings*);
 #endif
 
+/* SetInitialVideoSize(int width, int height)
+ *
+ * This optional function allows a front-end to set the initial video
+ * size for a video plugin.
+ *
+*/
+typedef void (*ptr_SetInitialVideoSize)(int width, int height);
+#if defined(M64P_PLUGIN_PROTOTYPES) || defined(M64P_CORE_PROTOTYPES)
+EXPORT void CALL SetInitialVideoSize(int width, int height);
+#endif
+
 #endif // __cplusplus
 
 #ifdef __cplusplus

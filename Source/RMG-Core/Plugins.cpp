@@ -511,6 +511,17 @@ CORE_EXPORT bool CorePluginsOpenROMConfig(CorePluginType type, void* parent, std
     return open_plugin_config(type, parent, true, file);
 }
 
+CORE_EXPORT void CoreSetInitialVideoSize(int width, int height)
+{
+    m64p::PluginApi& plugin = get_plugin(CorePluginType::Gfx);
+    if (!plugin.IsHooked() || plugin.SetInitialVideoSize == nullptr)
+    {
+        return;
+    }
+
+    plugin.SetInitialVideoSize(width, height);
+}
+
 CORE_EXPORT bool CoreAttachPlugins(void)
 {
     std::string error;

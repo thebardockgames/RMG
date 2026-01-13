@@ -37,6 +37,7 @@ class PluginApi
     ptr_PluginShutdown Shutdown;
     ptr_PluginConfig Config;
     ptr_PluginConfigWithRomConfig ConfigWithRomConfig;
+    ptr_SetInitialVideoSize SetInitialVideoSize;
     ptr_PluginGetVersion GetVersion;
 
   private:
