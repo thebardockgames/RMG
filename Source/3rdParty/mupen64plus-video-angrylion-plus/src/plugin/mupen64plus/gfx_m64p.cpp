@@ -68,6 +68,9 @@ extern int32_t win_width;
 extern int32_t win_height;
 extern int32_t win_fullscreen;
 
+extern int32_t init_win_width;
+extern int32_t init_win_height;
+
 EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle _CoreLibHandle, void *Context,
                                      void (*DebugCallback)(void *, int, const char *))
 {
@@ -168,6 +171,12 @@ extern "C"
         dialog.exec();
 
         return M64ERR_SUCCESS;
+    }
+
+    EXPORT void CALL SetInitialVideoSize(int width, int height)
+    {
+        init_win_width = width;
+        init_win_height = height;
     }
 }
 

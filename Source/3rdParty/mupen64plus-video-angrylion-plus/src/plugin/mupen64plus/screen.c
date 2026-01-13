@@ -23,6 +23,8 @@ static ptr_VidExt_GL_GetAttribute       CoreVideo_GL_GetAttribute = NULL;
 static ptr_VidExt_GL_SwapBuffers        CoreVideo_GL_SwapBuffers = NULL;
 
 // framebuffer texture states
+int32_t init_win_width = 0;
+int32_t init_win_height = 0;
 int32_t win_width;
 int32_t win_height;
 int32_t win_fullscreen;
@@ -61,6 +63,9 @@ void screen_init(struct n64video_config* config)
 #endif
 
     CoreVideo_GL_SetAttribute(M64P_GL_SWAP_CONTROL, config->vi.vsync);
+
+    win_width = init_win_width > 0 ? init_win_width : win_width;
+    win_height = init_win_height > 0 ? init_win_height : win_height;
 
     CoreVideo_SetVideoMode(win_width, win_height, 0, win_fullscreen ? M64VIDEO_FULLSCREEN : M64VIDEO_WINDOWED, M64VIDEOFLAG_SUPPORT_RESIZING);
 }
