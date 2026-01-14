@@ -63,10 +63,6 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     QLabel *ui_StatusBar_Label                     = nullptr;
     QLabel *ui_StatusBar_RenderModeLabel           = nullptr;
 
-    QByteArray ui_Geometry;
-    bool ui_Geometry_Maximized = false;
-    bool ui_Geometry_Saved = false;
-
     bool ui_HideCursorInEmulation = false;
     bool ui_HideCursorInFullscreenEmulation = false;
     bool ui_NoSwitchToRomBrowser = false;
@@ -135,7 +131,6 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     void updateUI(bool inEmulation, bool isPaused);
 
     void storeGeometry(void);
-    void loadGeometry(void);
 
     void initializeEmulationThread(void);
     void connectEmulationThreadSignals(void);

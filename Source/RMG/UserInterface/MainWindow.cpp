@@ -601,15 +601,12 @@ void MainWindow::updateUI(bool inEmulation, bool isPaused)
             // launch RMG with a ROM on the commandline or drag & drop
             this->ui_Widgets->setCurrentWidget(this->ui_Widget_Dummy);
         }
-
-        this->storeGeometry();
     }
     else if (!this->ui_NoSwitchToRomBrowser)
     {
         this->setWindowTitle(this->ui_WindowTitle);
         this->ui_Widgets->setCurrentWidget(this->ui_Widget_RomBrowser);
         this->ui_StatusBar_RenderModeLabel->clear();
-        this->loadGeometry();
     }
     else
     {
@@ -622,69 +619,9 @@ void MainWindow::updateUI(bool inEmulation, bool isPaused)
 
 void MainWindow::storeGeometry(void)
 {
-    if (this->ui_Geometry_Saved)
-    {
-        return;
-    }
-
-    this->ui_Geometry = this->saveGeometry();
-    this->ui_Geometry_Maximized = this->isMaximized();
-    this->ui_Geometry_Saved = true;
-
-    std::string geometryStr = this->ui_Geometry.toBase64().toStdString();
+    std::string geometryStr = this->saveGeometry().toBase64().toStdString();
     CoreSettingsSetValue(SettingsID::RomBrowser_Geometry, geometryStr);
-    CoreSettingsSetValue(SettingsID::RomBrowser_Maximized, this->ui_Geometry_Maximized);
-}
-
-void MainWindow::loadGeometry(void)
-{
-    if (!this->ui_Geometry_Saved)
-    {
-        return;
-    }
-
-    if (this->ui_Geometry_Maximized)
-    {
-        this->showMaximized();
-    }
-    else
-    {
-        this->restoreGeometry(this->ui_Geometry);
-    }
-
-    if (this->isFullScreen())
-    {
-        this->showNormal();
-    }
-
-    if (this->ui_ShowMenubar && this->menuBar()->isHidden())
-    {
-        this->menuBar()->show();
-    }
-    else if (!this->ui_ShowMenubar && !this->menuBar()->isHidden())
-    {
-        this->menuBar()->hide();
-    }
-
-    if (this->ui_ShowToolbar && this->toolBar->isHidden())
-    {
-        this->toolBar->show();
-    }
-    else if (!this->ui_ShowToolbar && !this->toolBar->isHidden())
-    {
-        this->toolBar->hide();
-    }
-
-    if (this->ui_ShowStatusbar && this->statusBar()->isHidden())
-    {
-        this->statusBar()->show();
-    }
-    else if (!this->ui_ShowStatusbar && !this->statusBar()->isHidden())
-    {
-        this->statusBar()->hide();
-    }
-
-    this->ui_Geometry_Saved = false;
+    CoreSettingsSetValue(SettingsID::RomBrowser_Maximized, this->isMaximized());
 }
 
 void MainWindow::initializeEmulationThread(void)
@@ -2367,7 +2304,7 @@ void MainWindow::on_NetplaySessionDialog_rejected()
 
 void MainWindow::on_VidExt_Init(VidExtRenderMode renderMode)
 {
-    this->ui_VidExtRenderMode   = renderMode;
+    this->ui_VidExtRenderMode = renderMode;
 
     if (CoreSettingsGetBoolValue(SettingsID::GUI_OpenGLES))
     {
