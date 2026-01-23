@@ -1038,6 +1038,7 @@
   </releases>
   <url type="homepage">https://github.com/Rosalie241/RMG</url>
   <url type="bugtracker">https://github.com/Rosalie241/RMG/issues</url>
+  <url type="vcs-browser">https://github.com/Rosalie241/RMG</url>
   <categories>
     <category>Game</category>
     <category>Emulator</category>
