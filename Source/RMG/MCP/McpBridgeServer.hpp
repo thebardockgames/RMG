@@ -73,6 +73,7 @@ class McpBridgeServer : public QObject
     QJsonObject handleResumeExecution(const QJsonObject& request) const;
     QJsonObject handleStepInstruction(const QJsonObject& request) const;
     QJsonObject handleAddBreakpoint(const QJsonObject& request) const;
+    QJsonObject handleAddWatchpoint(const QJsonObject& request) const;
     QJsonObject handleRemoveBreakpoint(const QJsonObject& request) const;
     QJsonObject handleListBreakpoints(const QJsonObject& request) const;
     QJsonObject handleClearBreakpoints(const QJsonObject& request) const;

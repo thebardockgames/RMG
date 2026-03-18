@@ -22,6 +22,8 @@
 #include <RMG-Core/m64p/api/m64p_types.h>
 
 #include <array>
+#include <initializer_list>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -32,6 +34,457 @@ constexpr quint32 kMaxDisassemblyInstructions = 256;
 constexpr quint32 kMaxStepCount = 1024;
 constexpr quint32 kMaxSymbolLookupResults = 128;
 constexpr quint32 kMaxEventResults = 512;
+
+struct ResolvedRequestTarget
+{
+    quint32 address = 0;
+    bool usedSymbol = false;
+    QString symbolName;
+    qint64 offset = 0;
+    CoreDebuggerSymbol symbol;
+};
+
+QString firstNonEmptyField(const QJsonObject& request, std::initializer_list<const char*> keys)
+{
+    for (const char* key : keys)
+    {
+        QString value = request.value(QString::fromLatin1(key)).toString().trimmed();
+        if (!value.isEmpty())
+        {
+            return value;
+        }
+    }
+
+    return {};
+}
+
+bool hasAnyField(const QJsonObject& request, std::initializer_list<const char*> keys)
+{
+    for (const char* key : keys)
+    {
+        if (!request.value(QString::fromLatin1(key)).isUndefined())
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+QString normalizeSymbolName(QString name)
+{
+    return name.trimmed().toLower();
+}
+
+bool tryParseSignedValue(const QJsonValue& value, qint64* parsedValue)
+{
+    if (parsedValue == nullptr || value.isUndefined() || value.isNull())
+    {
+        return false;
+    }
+
+    if (value.isDouble())
+    {
+        *parsedValue = value.toInteger();
+        return true;
+    }
+
+    QString text = value.toString().trimmed();
+    if (text.isEmpty())
+    {
+        return false;
+    }
+
+    bool negative = false;
+    if (text.startsWith(QLatin1Char('-')))
+    {
+        negative = true;
+        text.remove(0, 1);
+    }
+    else if (text.startsWith(QLatin1Char('+')))
+    {
+        text.remove(0, 1);
+    }
+
+    int base = 10;
+    if (text.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive))
+    {
+        base = 16;
+        text.remove(0, 2);
+    }
+
+    if (text.isEmpty())
+    {
+        return false;
+    }
+
+    bool ok = false;
+    qulonglong magnitude = text.toULongLong(&ok, base);
+    if (!ok)
+    {
+        return false;
+    }
+
+    const qulonglong maxPositive = static_cast<qulonglong>(std::numeric_limits<qint64>::max());
+    const qulonglong maxNegative = maxPositive + 1ULL;
+    if ((!negative && magnitude > maxPositive) ||
+        (negative && magnitude > maxNegative))
+    {
+        return false;
+    }
+
+    if (negative)
+    {
+        *parsedValue = magnitude == maxNegative
+                           ? std::numeric_limits<qint64>::min()
+                           : -static_cast<qint64>(magnitude);
+    }
+    else
+    {
+        *parsedValue = static_cast<qint64>(magnitude);
+    }
+
+    return true;
+}
+
+bool tryParseHexU32Local(QString text, quint32* value)
+{
+    if (value == nullptr)
+    {
+        return false;
+    }
+
+    text = text.trimmed();
+    if (text.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive))
+    {
+        text = text.mid(2);
+    }
+
+    bool ok = false;
+    uint parsedValue = text.toUInt(&ok, 16);
+    if (!ok)
+    {
+        return false;
+    }
+
+    *value = static_cast<quint32>(parsedValue);
+    return true;
+}
+
+QString formatSignedOffset(qint64 offset)
+{
+    if (offset == 0)
+    {
+        return QStringLiteral("0x00000000");
+    }
+
+    qulonglong magnitude = offset < 0
+                               ? static_cast<qulonglong>(-(offset + 1)) + 1ULL
+                               : static_cast<qulonglong>(offset);
+    QString payload = QStringLiteral("0x%1").arg(
+        QString::number(magnitude, 16).toUpper().rightJustified(8, QLatin1Char('0')));
+    return offset < 0 ? QStringLiteral("-%1").arg(payload) : payload;
+}
+
+bool addAddressOffset(quint32 baseAddress, qint64 offset, quint32* resolvedAddress, QString* error)
+{
+    if (resolvedAddress == nullptr)
+    {
+        return false;
+    }
+
+    qint64 candidate = static_cast<qint64>(baseAddress) + offset;
+    if (candidate < 0 || candidate > static_cast<qint64>(std::numeric_limits<quint32>::max()))
+    {
+        if (error != nullptr)
+        {
+            *error = QStringLiteral("Resolved address overflow for base %1 and offset %2")
+                         .arg(QStringLiteral("0x%1").arg(
+                                  QString::number(baseAddress, 16).toUpper().rightJustified(8, QLatin1Char('0'))),
+                              formatSignedOffset(offset));
+        }
+        return false;
+    }
+
+    *resolvedAddress = static_cast<quint32>(candidate);
+    return true;
+}
+
+bool tryResolveSymbolByName(const QString& query,
+                            CoreDebuggerSymbol* resolvedSymbol,
+                            QString* error)
+{
+    if (resolvedSymbol == nullptr)
+    {
+        return false;
+    }
+
+    const QString trimmedQuery = query.trimmed();
+    if (trimmedQuery.isEmpty())
+    {
+        if (error != nullptr)
+        {
+            *error = QStringLiteral("Symbol name must not be empty");
+        }
+        return false;
+    }
+
+    std::vector<CoreDebuggerSymbol> symbols;
+    if (!CoreDebuggerLookupSymbols(trimmedQuery.toStdString(), kMaxSymbolLookupResults, symbols))
+    {
+        if (error != nullptr)
+        {
+            *error = QString::fromStdString(CoreGetError());
+        }
+        return false;
+    }
+
+    const QString normalizedQuery = normalizeSymbolName(trimmedQuery);
+    std::vector<CoreDebuggerSymbol> exactMatches;
+    for (const CoreDebuggerSymbol& symbol : symbols)
+    {
+        if (normalizeSymbolName(QString::fromStdString(symbol.name)) == normalizedQuery)
+        {
+            exactMatches.push_back(symbol);
+        }
+    }
+
+    if (exactMatches.empty())
+    {
+        if (error != nullptr)
+        {
+            QStringList suggestions;
+            for (const CoreDebuggerSymbol& symbol : symbols)
+            {
+                suggestions.append(QString::fromStdString(symbol.name));
+                if (suggestions.size() >= 5)
+                {
+                    break;
+                }
+            }
+
+            *error = suggestions.isEmpty()
+                         ? QStringLiteral("Symbol not found: %1").arg(trimmedQuery)
+                         : QStringLiteral("Symbol not found: %1. Closest matches: %2")
+                               .arg(trimmedQuery, suggestions.join(QStringLiteral(", ")));
+        }
+        return false;
+    }
+
+    CoreDebuggerSymbol selected = exactMatches.front();
+    for (size_t index = 1; index < exactMatches.size(); index++)
+    {
+        if (exactMatches[index].address != selected.address)
+        {
+            if (error != nullptr)
+            {
+                QStringList addresses;
+                for (const CoreDebuggerSymbol& match : exactMatches)
+                {
+                    addresses.append(QStringLiteral("0x%1").arg(
+                        QString::number(match.address, 16).toUpper().rightJustified(8, QLatin1Char('0'))));
+                    if (addresses.size() >= 5)
+                    {
+                        break;
+                    }
+                }
+
+                *error = QStringLiteral("Symbol is ambiguous: %1 (%2)")
+                             .arg(trimmedQuery, addresses.join(QStringLiteral(", ")));
+            }
+            return false;
+        }
+    }
+
+    *resolvedSymbol = selected;
+    return true;
+}
+
+QJsonObject resolvedRequestTargetToJson(const ResolvedRequestTarget& target)
+{
+    QJsonObject payload{
+        {QStringLiteral("address"), QStringLiteral("0x%1").arg(
+                                         QString::number(target.address, 16).toUpper().rightJustified(8, QLatin1Char('0')))},
+        {QStringLiteral("mode"), target.usedSymbol ? QStringLiteral("symbol") : QStringLiteral("address")},
+    };
+
+    if (target.usedSymbol)
+    {
+        payload.insert(QStringLiteral("symbol"), target.symbolName);
+        payload.insert(QStringLiteral("offset"), formatSignedOffset(target.offset));
+        payload.insert(QStringLiteral("symbol_address"), QStringLiteral("0x%1").arg(
+                                                      QString::number(target.symbol.address, 16)
+                                                          .toUpper()
+                                                          .rightJustified(8, QLatin1Char('0'))));
+        payload.insert(QStringLiteral("source"), QString::fromStdString(target.symbol.source));
+    }
+
+    return payload;
+}
+
+bool resolveRequestTarget(const QJsonObject& request,
+                          std::initializer_list<const char*> addressKeys,
+                          std::initializer_list<const char*> symbolKeys,
+                          std::initializer_list<const char*> offsetKeys,
+                          ResolvedRequestTarget* target,
+                          QString* error)
+{
+    if (target == nullptr)
+    {
+        return false;
+    }
+
+    *target = {};
+
+    const QString addressText = firstNonEmptyField(request, addressKeys);
+    if (!addressText.isEmpty())
+    {
+        quint32 parsedAddress = 0;
+        if (!tryParseHexU32Local(addressText, &parsedAddress))
+        {
+            if (error != nullptr)
+            {
+                *error = QStringLiteral("Invalid address: %1").arg(addressText);
+            }
+            return false;
+        }
+
+        target->address = parsedAddress;
+        return true;
+    }
+
+    const QString symbolName = firstNonEmptyField(request, symbolKeys);
+    if (symbolName.isEmpty())
+    {
+        if (error != nullptr)
+        {
+            *error = QStringLiteral("Missing required field: address or symbol");
+        }
+        return false;
+    }
+
+    qint64 offset = 0;
+    for (const char* key : offsetKeys)
+    {
+        const QJsonValue value = request.value(QString::fromLatin1(key));
+        if (value.isUndefined())
+        {
+            continue;
+        }
+
+        if (!tryParseSignedValue(value, &offset))
+        {
+            if (error != nullptr)
+            {
+                *error = QStringLiteral("Invalid offset field: %1").arg(QString::fromLatin1(key));
+            }
+            return false;
+        }
+        break;
+    }
+
+    CoreDebuggerSymbol symbol;
+    if (!tryResolveSymbolByName(symbolName, &symbol, error))
+    {
+        return false;
+    }
+
+    quint32 resolvedAddress = 0;
+    if (!addAddressOffset(symbol.address, offset, &resolvedAddress, error))
+    {
+        return false;
+    }
+
+    target->address = resolvedAddress;
+    target->usedSymbol = true;
+    target->symbolName = symbolName.trimmed();
+    target->offset = offset;
+    target->symbol = symbol;
+    return true;
+}
+
+bool tryParsePositiveSize(const QJsonValue& value, quint32* size)
+{
+    qint64 parsedValue = 0;
+    if (!tryParseSignedValue(value, &parsedValue) || parsedValue <= 0 ||
+        parsedValue > static_cast<qint64>(std::numeric_limits<quint32>::max()))
+    {
+        return false;
+    }
+
+    if (size != nullptr)
+    {
+        *size = static_cast<quint32>(parsedValue);
+    }
+    return true;
+}
+
+bool resolveRequestRange(const QJsonObject& request,
+                         ResolvedRequestTarget* startTarget,
+                         ResolvedRequestTarget* endTarget,
+                         QString* error)
+{
+    if (!resolveRequestTarget(request,
+                              {"address", "address_hex"},
+                              {"symbol", "symbol_name", "name"},
+                              {"offset", "offset_bytes", "offset_hex"},
+                              startTarget,
+                              error))
+    {
+        return false;
+    }
+
+    if (endTarget != nullptr)
+    {
+        *endTarget = *startTarget;
+    }
+
+    const bool hasExplicitEnd = hasAnyField(request, {"end_address", "endAddress", "end_symbol", "endSymbol"});
+    if (hasExplicitEnd)
+    {
+        if (endTarget == nullptr)
+        {
+            return true;
+        }
+
+        return resolveRequestTarget(request,
+                                    {"end_address", "endAddress"},
+                                    {"end_symbol", "endSymbol"},
+                                    {"end_offset", "endOffset", "end_offset_bytes", "end_offset_hex"},
+                                    endTarget,
+                                    error);
+    }
+
+    const QJsonValue sizeValue = request.value(QStringLiteral("size"));
+    const QJsonValue sizeBytesValue = request.value(QStringLiteral("size_bytes"));
+    if (!sizeValue.isUndefined() || !sizeBytesValue.isUndefined())
+    {
+        quint32 size = 0;
+        if (!tryParsePositiveSize(sizeValue.isUndefined() ? sizeBytesValue : sizeValue, &size))
+        {
+            if (error != nullptr)
+            {
+                *error = QStringLiteral("Invalid size. Expected a positive byte count.");
+            }
+            return false;
+        }
+
+        if (endTarget != nullptr)
+        {
+            endTarget->address = startTarget->address + size - 1;
+            if (endTarget->address < startTarget->address)
+            {
+                if (error != nullptr)
+                {
+                    *error = QStringLiteral("Resolved address range overflowed the 32-bit address space");
+                }
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
 
 QString requestRegisterName(const QJsonObject& request)
 {
@@ -386,6 +839,11 @@ QJsonObject McpBridgeServer::processRequest(const QJsonObject& request) const
         return this->handleAddBreakpoint(request);
     }
 
+    if (action == QStringLiteral("add_watchpoint"))
+    {
+        return this->handleAddWatchpoint(request);
+    }
+
     if (action == QStringLiteral("remove_breakpoint"))
     {
         return this->handleRemoveBreakpoint(request);
@@ -441,13 +899,18 @@ QJsonObject McpBridgeServer::processRequest(const QJsonObject& request) const
 
 QJsonObject McpBridgeServer::handleReadRam(const QJsonObject& request) const
 {
-    QString addressText = request.value(QStringLiteral("address")).toString();
     int sizeValue = request.value(QStringLiteral("size")).toInt(-1);
 
-    quint32 address = 0;
-    if (!tryParseHexU32(addressText, &address))
+    QString errorMessage;
+    ResolvedRequestTarget target;
+    if (!resolveRequestTarget(request,
+                              {"address", "address_hex"},
+                              {"symbol", "symbol_name", "name"},
+                              {"offset", "offset_bytes", "offset_hex"},
+                              &target,
+                              &errorMessage))
     {
-        return makeErrorResponse(request, QStringLiteral("Invalid address: %1").arg(addressText));
+        return makeErrorResponse(request, errorMessage);
     }
 
     if (sizeValue <= 0 || sizeValue > static_cast<int>(kMaxReadSize))
@@ -458,7 +921,7 @@ QJsonObject McpBridgeServer::handleReadRam(const QJsonObject& request) const
     }
 
     std::vector<uint8_t> bytes;
-    if (!CoreDebuggerReadMemory(address, static_cast<uint32_t>(sizeValue), bytes))
+    if (!CoreDebuggerReadMemory(target.address, static_cast<uint32_t>(sizeValue), bytes))
     {
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
@@ -469,17 +932,22 @@ QJsonObject McpBridgeServer::handleReadRam(const QJsonObject& request) const
 
 QJsonObject McpBridgeServer::handleWriteRam(const QJsonObject& request) const
 {
-    QString addressText = request.value(QStringLiteral("address")).toString();
     QString dataText = request.value(QStringLiteral("data")).toString();
     if (dataText.isEmpty())
     {
         dataText = request.value(QStringLiteral("bytes_hex")).toString();
     }
 
-    quint32 address = 0;
-    if (!tryParseHexU32(addressText, &address))
+    QString errorMessage;
+    ResolvedRequestTarget target;
+    if (!resolveRequestTarget(request,
+                              {"address", "address_hex"},
+                              {"symbol", "symbol_name", "name"},
+                              {"offset", "offset_bytes", "offset_hex"},
+                              &target,
+                              &errorMessage))
     {
-        return makeErrorResponse(request, QStringLiteral("Invalid address: %1").arg(addressText));
+        return makeErrorResponse(request, errorMessage);
     }
 
     QByteArray bytes;
@@ -489,16 +957,17 @@ QJsonObject McpBridgeServer::handleWriteRam(const QJsonObject& request) const
     }
 
     std::vector<uint8_t> payload(bytes.begin(), bytes.end());
-    if (!CoreDebuggerWriteMemory(address, payload))
+    if (!CoreDebuggerWriteMemory(target.address, payload))
     {
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
 
     QJsonObject response{
-        {QStringLiteral("address"), u32ToHexString(address)},
+        {QStringLiteral("address"), u32ToHexString(target.address)},
         {QStringLiteral("size"), static_cast<int>(bytes.size())},
         {QStringLiteral("data"), bytesToHexString(bytes)},
     };
+    response.insert(QStringLiteral("requested_target"), resolvedRequestTargetToJson(target));
     return makeOkResponse(request, response);
 }
 
@@ -652,39 +1121,50 @@ QJsonObject McpBridgeServer::handleCpuSnapshot(const QJsonObject& request) const
 
 QJsonObject McpBridgeServer::handleTranslateAddress(const QJsonObject& request) const
 {
-    QString addressText = request.value(QStringLiteral("address")).toString();
-    quint32 address = 0;
-    if (!tryParseHexU32(addressText, &address))
+    QString errorMessage;
+    ResolvedRequestTarget target;
+    if (!resolveRequestTarget(request,
+                              {"address", "address_hex"},
+                              {"symbol", "symbol_name", "name"},
+                              {"offset", "offset_bytes", "offset_hex"},
+                              &target,
+                              &errorMessage))
     {
-        return makeErrorResponse(request, QStringLiteral("Invalid address: %1").arg(addressText));
+        return makeErrorResponse(request, errorMessage);
     }
 
     quint32 physicalAddress = 0;
-    if (!CoreDebuggerVirtualToPhysical(address, physicalAddress))
+    if (!CoreDebuggerVirtualToPhysical(target.address, physicalAddress))
     {
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
 
     QJsonObject payload{
-        {QStringLiteral("virtual_address"), u32ToHexString(address)},
+        {QStringLiteral("virtual_address"), u32ToHexString(target.address)},
         {QStringLiteral("physical_address"), u32ToHexString(physicalAddress)},
     };
+    payload.insert(QStringLiteral("requested_target"), resolvedRequestTargetToJson(target));
     return makeOkResponse(request, payload);
 }
 
 QJsonObject McpBridgeServer::handleDisassemble(const QJsonObject& request) const
 {
-    QString addressText = request.value(QStringLiteral("address")).toString();
     int countValue = request.value(QStringLiteral("count")).toInt(0);
     if (countValue <= 0)
     {
         countValue = request.value(QStringLiteral("instruction_count")).toInt(0);
     }
 
-    quint32 address = 0;
-    if (!tryParseHexU32(addressText, &address))
+    QString errorMessage;
+    ResolvedRequestTarget target;
+    if (!resolveRequestTarget(request,
+                              {"address", "address_hex"},
+                              {"symbol", "symbol_name", "name"},
+                              {"offset", "offset_bytes", "offset_hex"},
+                              &target,
+                              &errorMessage))
     {
-        return makeErrorResponse(request, QStringLiteral("Invalid address: %1").arg(addressText));
+        return makeErrorResponse(request, errorMessage);
     }
 
     if (countValue <= 0 || countValue > static_cast<int>(kMaxDisassemblyInstructions))
@@ -695,7 +1175,7 @@ QJsonObject McpBridgeServer::handleDisassemble(const QJsonObject& request) const
     }
 
     std::vector<CoreDebuggerInstruction> instructions;
-    if (!CoreDebuggerDisassemble(address, static_cast<uint32_t>(countValue), instructions))
+    if (!CoreDebuggerDisassemble(target.address, static_cast<uint32_t>(countValue), instructions))
     {
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
@@ -774,23 +1254,12 @@ QJsonObject McpBridgeServer::handleStepInstruction(const QJsonObject& request) c
 
 QJsonObject McpBridgeServer::handleAddBreakpoint(const QJsonObject& request) const
 {
-    QString addressText = request.value(QStringLiteral("address")).toString();
-    QString endAddressText = request.value(QStringLiteral("end_address")).toString();
-    if (endAddressText.isEmpty())
+    QString errorMessage;
+    ResolvedRequestTarget startTarget;
+    ResolvedRequestTarget endTarget;
+    if (!resolveRequestRange(request, &startTarget, &endTarget, &errorMessage))
     {
-        endAddressText = request.value(QStringLiteral("endAddress")).toString();
-    }
-
-    quint32 address = 0;
-    if (!tryParseHexU32(addressText, &address))
-    {
-        return makeErrorResponse(request, QStringLiteral("Invalid address: %1").arg(addressText));
-    }
-
-    quint32 endAddress = address;
-    if (!endAddressText.isEmpty() && !tryParseHexU32(endAddressText, &endAddress))
-    {
-        return makeErrorResponse(request, QStringLiteral("Invalid end_address: %1").arg(endAddressText));
+        return makeErrorResponse(request, errorMessage);
     }
 
     quint32 flags = 0;
@@ -843,7 +1312,7 @@ QJsonObject McpBridgeServer::handleAddBreakpoint(const QJsonObject& request) con
     }
 
     int breakpointIndex = -1;
-    if (!CoreDebuggerAddBreakpoint(address, endAddress, flags, breakpointIndex))
+    if (!CoreDebuggerAddBreakpoint(startTarget.address, endTarget.address, flags, breakpointIndex))
     {
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
@@ -851,28 +1320,84 @@ QJsonObject McpBridgeServer::handleAddBreakpoint(const QJsonObject& request) con
     return makeOkResponse(request,
                           QJsonObject{
                               {QStringLiteral("index"), breakpointIndex},
-                              {QStringLiteral("address"), u32ToHexString(address)},
-                              {QStringLiteral("end_address"), u32ToHexString(endAddress)},
+                              {QStringLiteral("address"), u32ToHexString(startTarget.address)},
+                              {QStringLiteral("end_address"), u32ToHexString(endTarget.address)},
                               {QStringLiteral("flags"), breakpointFlagsToString(flags)},
                               {QStringLiteral("kinds"), breakpointKindsToJson(flags)},
+                              {QStringLiteral("requested_target"), resolvedRequestTargetToJson(startTarget)},
+                              {QStringLiteral("requested_end_target"), resolvedRequestTargetToJson(endTarget)},
                           });
 }
 
-QJsonObject McpBridgeServer::handleRemoveBreakpoint(const QJsonObject& request) const
+QJsonObject McpBridgeServer::handleAddWatchpoint(const QJsonObject& request) const
 {
-    QString addressText = request.value(QStringLiteral("address")).toString();
-    quint32 address = 0;
-    if (!tryParseHexU32(addressText, &address))
+    QJsonObject translatedRequest = request;
+
+    QString errorMessage;
+    ResolvedRequestTarget startTarget;
+    ResolvedRequestTarget endTarget;
+    if (!resolveRequestRange(request, &startTarget, &endTarget, &errorMessage))
     {
-        return makeErrorResponse(request, QStringLiteral("Invalid address: %1").arg(addressText));
+        return makeErrorResponse(request, errorMessage);
     }
 
-    if (!CoreDebuggerRemoveBreakpoint(address))
+    quint32 physicalAddress = 0;
+    quint32 physicalEndAddress = 0;
+    if (!CoreDebuggerVirtualToPhysical(startTarget.address, physicalAddress) ||
+        !CoreDebuggerVirtualToPhysical(endTarget.address, physicalEndAddress))
     {
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
 
-    return makeOkResponse(request, QJsonObject{{QStringLiteral("address"), u32ToHexString(address)}});
+    translatedRequest.insert(QStringLiteral("address"), u32ToHexString(physicalAddress));
+    translatedRequest.insert(QStringLiteral("end_address"), u32ToHexString(physicalEndAddress));
+
+    QJsonObject response = this->handleAddBreakpoint(translatedRequest);
+    if (response.value(QStringLiteral("status")).toString() != QStringLiteral("ok"))
+    {
+        copyRequestId(request, &response);
+        return response;
+    }
+
+    QJsonObject data = response.value(QStringLiteral("data")).toObject();
+    data.insert(QStringLiteral("requested_address"), u32ToHexString(startTarget.address));
+    data.insert(QStringLiteral("requested_end_address"), u32ToHexString(endTarget.address));
+    data.insert(QStringLiteral("resolved_address_space"), QStringLiteral("physical"));
+    data.insert(QStringLiteral("virtual_address"), u32ToHexString(startTarget.address));
+    data.insert(QStringLiteral("virtual_end_address"), u32ToHexString(endTarget.address));
+    data.insert(QStringLiteral("physical_address"), u32ToHexString(physicalAddress));
+    data.insert(QStringLiteral("physical_end_address"), u32ToHexString(physicalEndAddress));
+    data.insert(QStringLiteral("requested_target"), resolvedRequestTargetToJson(startTarget));
+    data.insert(QStringLiteral("requested_end_target"), resolvedRequestTargetToJson(endTarget));
+    response.insert(QStringLiteral("data"), data);
+    copyRequestId(request, &response);
+    return response;
+}
+
+QJsonObject McpBridgeServer::handleRemoveBreakpoint(const QJsonObject& request) const
+{
+    QString errorMessage;
+    ResolvedRequestTarget target;
+    if (!resolveRequestTarget(request,
+                              {"address", "address_hex"},
+                              {"symbol", "symbol_name", "name"},
+                              {"offset", "offset_bytes", "offset_hex"},
+                              &target,
+                              &errorMessage))
+    {
+        return makeErrorResponse(request, errorMessage);
+    }
+
+    if (!CoreDebuggerRemoveBreakpoint(target.address))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("address"), u32ToHexString(target.address)},
+                              {QStringLiteral("requested_target"), resolvedRequestTargetToJson(target)},
+                          });
 }
 
 QJsonObject McpBridgeServer::handleListBreakpoints(const QJsonObject& request) const

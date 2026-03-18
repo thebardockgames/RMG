@@ -74,6 +74,13 @@ def _normalize_watchpoint_access(access: str) -> list[str]:
     return aliases[normalized]
 
 
+def _normalize_symbol_name(symbol_name: str) -> str:
+    normalized = symbol_name.strip()
+    if not normalized:
+        raise ValueError("symbol_name must not be empty")
+    return normalized
+
+
 @dataclass(slots=True)
 class BridgeConfig:
     host: str = DEFAULT_BRIDGE_HOST
@@ -229,6 +236,41 @@ async def write_rdram(address_hex: str, data_hex: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def read_symbol(symbol_name: str, size_bytes: int, offset_bytes: int = 0) -> str:
+    """Read bytes starting at an exact loaded symbol name plus an optional byte offset."""
+
+    if size_bytes <= 0:
+        raise ValueError("size_bytes must be greater than zero")
+
+    response = await bridge.request(
+        "read_ram",
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+        size=size_bytes,
+    )
+    data = response.get("data")
+    if not isinstance(data, str):
+        raise BridgeProtocolError("Bridge returned a non-string payload for read_symbol")
+    return data
+
+
+@mcp.tool()
+async def write_symbol(symbol_name: str, data_hex: str, offset_bytes: int = 0) -> dict[str, Any]:
+    """Write bytes at an exact loaded symbol name plus an optional byte offset."""
+
+    response = await bridge.request(
+        "write_ram",
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+        data=_normalize_hex(data_hex, even_length=True),
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for write_symbol")
+    return data
+
+
+@mcp.tool()
 async def read_mips_register(register_name: str) -> str:
     """Read one VR4300 register by name, for example pc, ra, sp, a0, t0 or status."""
 
@@ -285,14 +327,29 @@ async def cpu_snapshot() -> dict[str, Any]:
 
 
 @mcp.tool()
-async def translate_address(address_hex: str) -> dict[str, str]:
+async def translate_address(address_hex: str) -> dict[str, Any]:
     """Translate a virtual CPU address to a physical address when the core can resolve it."""
 
     response = await bridge.request("translate_address", address=_normalize_hex(address_hex))
     data = response.get("data")
     if not isinstance(data, dict):
         raise BridgeProtocolError("Bridge returned a non-object payload for translate_address")
-    return {str(key): str(value) for key, value in data.items()}
+    return data
+
+
+@mcp.tool()
+async def resolve_symbol_name(symbol_name: str, offset_bytes: int = 0) -> dict[str, Any]:
+    """Resolve an exact symbol name to its virtual and physical address, optionally applying a byte offset."""
+
+    response = await bridge.request(
+        "translate_address",
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for resolve_symbol_name")
+    return data
 
 
 @mcp.tool()
@@ -310,6 +367,29 @@ async def disassemble_rdram(address_hex: str, instruction_count: int = 8) -> lis
     data = response.get("data")
     if not isinstance(data, list):
         raise BridgeProtocolError("Bridge returned a non-array payload for disassemble")
+    return [item for item in data if isinstance(item, dict)]
+
+
+@mcp.tool()
+async def disassemble_symbol(
+    symbol_name: str,
+    instruction_count: int = 8,
+    offset_bytes: int = 0,
+) -> list[dict[str, Any]]:
+    """Disassemble instructions starting from an exact symbol name plus an optional byte offset."""
+
+    if instruction_count <= 0:
+        raise ValueError("instruction_count must be greater than zero")
+
+    response = await bridge.request(
+        "disassemble",
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+        instruction_count=instruction_count,
+    )
+    data = response.get("data")
+    if not isinstance(data, list):
+        raise BridgeProtocolError("Bridge returned a non-array payload for disassemble_symbol")
     return [item for item in data if isinstance(item, dict)]
 
 
@@ -387,6 +467,45 @@ async def remove_breakpoint(address_hex: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def remove_symbol_breakpoint(symbol_name: str, offset_bytes: int = 0) -> dict[str, Any]:
+    """Remove an execute breakpoint using an exact symbol name plus an optional byte offset."""
+
+    response = await bridge.request(
+        "remove_breakpoint",
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for remove_symbol_breakpoint")
+    return data
+
+
+@mcp.tool()
+async def remove_symbol_watchpoint(symbol_name: str, offset_bytes: int = 0) -> dict[str, Any]:
+    """Remove a memory watchpoint using an exact symbol name plus an optional byte offset."""
+
+    resolved = await bridge.request(
+        "translate_address",
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+    )
+    payload = resolved.get("data")
+    if not isinstance(payload, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for translate_address")
+
+    physical_address = payload.get("physical_address")
+    if not isinstance(physical_address, str):
+        raise BridgeProtocolError("Bridge returned a non-string physical_address for remove_symbol_watchpoint")
+
+    response = await bridge.request("remove_breakpoint", address=physical_address)
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for remove_symbol_watchpoint")
+    return data
+
+
+@mcp.tool()
 async def list_breakpoints() -> dict[str, Any]:
     """List breakpoints tracked through the MCP bridge and report the core breakpoint count."""
 
@@ -416,7 +535,7 @@ async def add_watchpoint(
     enabled: bool = True,
     log: bool = False,
 ) -> dict[str, Any]:
-    """Add a watchpoint for read, write or execute access using the same debugger backend as breakpoints."""
+    """Add a watchpoint for read, write or execute access. Memory watchpoints are translated to physical addresses automatically."""
 
     payload: dict[str, Any] = {
         "address": _normalize_hex(address_hex),
@@ -427,10 +546,77 @@ async def add_watchpoint(
     if end_address_hex is not None and end_address_hex.strip():
         payload["end_address"] = _normalize_hex(end_address_hex)
 
-    response = await bridge.request("add_breakpoint", **payload)
+    response = await bridge.request("add_watchpoint", **payload)
     data = response.get("data")
     if not isinstance(data, dict):
         raise BridgeProtocolError("Bridge returned a non-object payload for add_watchpoint")
+    return data
+
+
+@mcp.tool()
+async def add_symbol_breakpoint(
+    symbol_name: str,
+    kind: str = "execute",
+    offset_bytes: int = 0,
+    end_offset_bytes: int | None = None,
+    size_bytes: int | None = None,
+    enabled: bool = True,
+    log: bool = False,
+) -> dict[str, Any]:
+    """Add an execute breakpoint using an exact symbol name plus an optional byte offset or byte range."""
+
+    normalized_kind = _normalize_breakpoint_kind(kind)
+    if normalized_kind != "execute":
+        raise ValueError("add_symbol_breakpoint only supports execute breakpoints; use add_symbol_watchpoint for memory access")
+
+    payload: dict[str, Any] = {
+        "symbol": _normalize_symbol_name(symbol_name),
+        "offset": offset_bytes,
+        "kind": normalized_kind,
+        "enabled": enabled,
+        "log": log,
+    }
+    if end_offset_bytes is not None:
+        payload["end_symbol"] = payload["symbol"]
+        payload["end_offset"] = end_offset_bytes
+    elif size_bytes is not None:
+        if size_bytes <= 0:
+            raise ValueError("size_bytes must be greater than zero")
+        payload["size"] = size_bytes
+
+    response = await bridge.request("add_breakpoint", **payload)
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for add_symbol_breakpoint")
+    return data
+
+
+@mcp.tool()
+async def add_symbol_watchpoint(
+    symbol_name: str,
+    access: str = "read_write",
+    offset_bytes: int = 0,
+    size_bytes: int = 4,
+    enabled: bool = True,
+    log: bool = False,
+) -> dict[str, Any]:
+    """Add a watchpoint using an exact symbol name plus an optional byte offset and byte size."""
+
+    if size_bytes <= 0:
+        raise ValueError("size_bytes must be greater than zero")
+
+    response = await bridge.request(
+        "add_watchpoint",
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+        kinds=_normalize_watchpoint_access(access),
+        size=size_bytes,
+        enabled=enabled,
+        log=log,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for add_symbol_watchpoint")
     return data
 
 
