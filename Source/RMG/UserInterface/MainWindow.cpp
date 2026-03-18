@@ -29,6 +29,9 @@
 #include "OnScreenDisplay.hpp"
 #include "Callbacks.hpp"
 #include "VidExt.hpp"
+#ifdef MCP_BRIDGE
+#include "MCP/McpBridgeServer.hpp"
+#endif // MCP_BRIDGE
 
 #ifdef UPDATER
 #include <QNetworkAccessManager>
@@ -144,6 +147,19 @@ bool MainWindow::Init(QApplication* app, bool showUI, bool launchROM)
         return false;
     }
 
+#ifdef MCP_BRIDGE
+    this->mcpBridgeServer = new MCP::McpBridgeServer(8765, this);
+    connect(this->mcpBridgeServer, &MCP::McpBridgeServer::ServerError, this, [this](const QString& message) {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning, "[MCP] " + message.toStdString());
+    });
+
+    if (this->mcpBridgeServer->Start())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                               "[MCP] Listening on ws://127.0.0.1:" + std::to_string(this->mcpBridgeServer->Port()));
+    }
+#endif // MCP_BRIDGE
+
     // add actions when there's no UI
     if (!showUI)
     {
@@ -214,6 +230,13 @@ void MainWindow::closeEvent(QCloseEvent *event)
     this->ui_Widget_RomBrowser->StopRefreshRomList();
 
     this->coreCallBacks->Stop();
+
+#ifdef MCP_BRIDGE
+    if (this->mcpBridgeServer != nullptr)
+    {
+        this->mcpBridgeServer->Stop();
+    }
+#endif // MCP_BRIDGE
 
 #ifdef NETPLAY
     if (this->netplaySessionDialog != nullptr)

@@ -1,6 +1,11 @@
 # CMake build directory
 Build/
 Bin/
+build-mcp/
+build-mcp-ucrt/
+# Python cache
+__pycache__/
+*.pyc
 # Clangd cache
 .cache/
 # Archlinux Package

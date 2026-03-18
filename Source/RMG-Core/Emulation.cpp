@@ -12,6 +12,7 @@
 #include "RomSettings.hpp"
 #include "Emulation.hpp"
 #include "RomHeader.hpp"
+#include "Debugger.hpp"
 #include "Settings.hpp"
 #include "Library.hpp"
 #include "Netplay.hpp"
@@ -226,6 +227,8 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
     // apply pif rom settings
     apply_pif_rom_settings();
 
+    CoreDebuggerResetSession();
+
 #ifdef NETPLAY
     if (netplay)
     {
@@ -246,6 +249,14 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
         {
             error = "CoreStartEmulation m64p::Core.DoCommand(M64CMD_EXECUTE) Failed: ";
             error += m64p::Core.ErrorMessage(m64p_ret);
+        }
+        else
+        {
+            CoreDebuggerConfigureCallbacks();
+            if (CoreDebuggerSupported())
+            {
+                m64p::Debugger.DebugSetRunState(M64P_DBG_RUNSTATE_RUNNING);
+            }
         }
     }
 
@@ -295,6 +306,8 @@ CORE_EXPORT bool CoreStopEmulation(void)
         CoreSetError(error);
         return false;
     }
+
+    CoreDebuggerResetSession();
 
     return ret == M64ERR_SUCCESS;
 }

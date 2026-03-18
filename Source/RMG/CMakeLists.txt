@@ -29,10 +29,17 @@ if (KCA_DRAG_DROP)
     add_definitions(-DKCA_DRAG_DROP)
 endif(KCA_DRAG_DROP)
 
-if (NETPLAY)
+if (NETPLAY OR MCP_BRIDGE)
     find_package(Qt6 COMPONENTS WebSockets REQUIRED)
+endif(NETPLAY OR MCP_BRIDGE)
+
+if (NETPLAY)
     add_definitions(-DNETPLAY)
 endif(NETPLAY)
+
+if (MCP_BRIDGE)
+    add_definitions(-DMCP_BRIDGE)
+endif(MCP_BRIDGE)
 
 find_package(SDL3 REQUIRED)
 
@@ -111,6 +118,12 @@ if (NETPLAY)
     )
 endif(NETPLAY)
 
+if (MCP_BRIDGE)
+    list(APPEND RMG_SOURCES
+        MCP/McpBridgeServer.cpp
+    )
+endif(MCP_BRIDGE)
+
 set_source_files_properties(${IMGUI_SOURCES} PROPERTIES GENERATED TRUE)
 list(APPEND RMG_SOURCES ${IMGUI_SOURCES})
 
@@ -153,7 +166,7 @@ if (KCA_DRAG_DROP)
     target_link_libraries(RMG KF6::CoreAddons)
 endif(KCA_DRAG_DROP)
 
-if (NETPLAY)
+if (NETPLAY OR MCP_BRIDGE)
     target_link_libraries(RMG Qt6::WebSockets)
-endif(NETPLAY)
+endif(NETPLAY OR MCP_BRIDGE)
 

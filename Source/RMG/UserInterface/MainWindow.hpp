@@ -36,6 +36,13 @@
 
 #include "ui_MainWindow.h"
 
+#ifdef MCP_BRIDGE
+namespace MCP
+{
+class McpBridgeServer;
+}
+#endif // MCP_BRIDGE
+
 namespace UserInterface
 {
 class MainWindow : public QMainWindow, private Ui::MainWindow
@@ -53,6 +60,9 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     Thread::EmulationThread *emulationThread = nullptr;
 
     CoreCallbacks* coreCallBacks = nullptr;
+#ifdef MCP_BRIDGE
+    MCP::McpBridgeServer* mcpBridgeServer = nullptr;
+#endif // MCP_BRIDGE
 
     QStackedWidget *ui_Widgets                     = nullptr;
     Widget::DummyWidget *ui_Widget_Dummy           = nullptr;

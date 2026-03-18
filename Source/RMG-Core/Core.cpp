@@ -12,6 +12,7 @@
 #include "Directories.hpp"
 #include "MediaLoader.hpp"
 #include "Callback.hpp"
+#include "Debugger.hpp"
 #include "Settings.hpp"
 #include "Library.hpp"
 #include "Plugins.hpp"
@@ -116,6 +117,8 @@ CORE_EXPORT bool CoreInit(void)
         return false;
     }
 
+    m64p::Debugger.Hook(l_CoreLibHandle);
+
     m64p_ret = m64p::Core.Startup(FRONTEND_API_VERSION, 
                                     CoreGetUserConfigDirectory().string().c_str(), 
                                     CoreGetSharedDataDirectory().string().c_str(), 
@@ -138,6 +141,8 @@ CORE_EXPORT bool CoreInit(void)
     {
         return false;
     }
+
+    CoreDebuggerConfigureCallbacks();
 
     ret = CoreSettingsUpgrade();
     if (!ret)
@@ -172,9 +177,11 @@ CORE_EXPORT void CoreShutdown(void)
     CorePluginsShutdown();
 
     CoreSaveRomHeaderAndSettingsCache();
+    CoreDebuggerResetSession();
 
     m64p::Core.Shutdown();
 
+    m64p::Debugger.Unhook();
     m64p::Core.Unhook();
     m64p::Config.Unhook();
 

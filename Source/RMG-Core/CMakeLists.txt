@@ -21,9 +21,11 @@ set(RMG_CORE_SOURCES
     m64p/Api.cpp
     m64p/CoreApi.cpp
     m64p/ConfigApi.cpp
+    m64p/DebuggerApi.cpp
     m64p/PluginApi.cpp
     CachedRomHeaderAndSettings.cpp
     ConvertStringEncoding.cpp
+    Debugger.cpp
     SpeedLimiter.cpp
     SpeedFactor.cpp
     RomSettings.cpp
