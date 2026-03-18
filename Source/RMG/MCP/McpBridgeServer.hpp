@@ -20,6 +20,8 @@
 #include <QSet>
 #include <QString>
 
+#include <functional>
+
 #include <RMG-Core/Debugger.hpp>
 
 QT_FORWARD_DECLARE_CLASS(QWebSocket)
@@ -41,6 +43,7 @@ class McpBridgeServer : public QObject
 
     bool IsRunning(void) const;
     quint16 Port(void) const;
+    void SetRestartRomHandler(std::function<bool(QString*)> handler);
 
   signals:
     void ServerError(QString message);
@@ -55,7 +58,10 @@ class McpBridgeServer : public QObject
     struct EventStreamSubscription
     {
         bool includeVi = false;
-        QStringList filters;
+        QStringList typeFilters;
+        bool hasPcRange = false;
+        quint32 pcStart = 0;
+        quint32 pcEnd = 0;
     };
 
     void sendJson(QWebSocket* socket, const QJsonObject& payload) const;
@@ -71,7 +77,12 @@ class McpBridgeServer : public QObject
     QJsonObject handleDisassemble(const QJsonObject& request) const;
     QJsonObject handlePauseExecution(const QJsonObject& request) const;
     QJsonObject handleResumeExecution(const QJsonObject& request) const;
+    QJsonObject handleResetEmulation(const QJsonObject& request) const;
+    QJsonObject handleRestartRom(const QJsonObject& request) const;
     QJsonObject handleStepInstruction(const QJsonObject& request) const;
+    QJsonObject handleRunUntil(const QJsonObject& request) const;
+    QJsonObject handleStepOver(const QJsonObject& request) const;
+    QJsonObject handleStepOut(const QJsonObject& request) const;
     QJsonObject handleAddBreakpoint(const QJsonObject& request) const;
     QJsonObject handleAddWatchpoint(const QJsonObject& request) const;
     QJsonObject handleRemoveBreakpoint(const QJsonObject& request) const;
@@ -109,6 +120,7 @@ class McpBridgeServer : public QObject
     QList<QWebSocket*> clients;
     QHash<QWebSocket*, EventStreamSubscription> eventSubscribers;
     quint64 lastBroadcastEventId = 0;
+    std::function<bool(QString*)> restartRomHandler;
 };
 } // namespace MCP
 

@@ -32,6 +32,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <thread>
 
 namespace
 {
@@ -433,6 +434,65 @@ bool ensure_debugger_paused(void)
     }
 
     return true;
+}
+
+uint32_t read_be_u32(const std::vector<uint8_t>& bytes, size_t offset);
+
+bool read_current_instruction(uint32_t* pcValue, uint32_t* instructionWord, CoreDebuggerInstruction* instruction)
+{
+    if (pcValue == nullptr || instructionWord == nullptr)
+    {
+        return false;
+    }
+
+    uint64_t pc = 0;
+    if (!CoreDebuggerReadCpuRegister("pc", pc))
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (!CoreDebuggerReadMemory(static_cast<uint32_t>(pc), 4, bytes) || bytes.size() != 4)
+    {
+        return false;
+    }
+
+    const uint32_t word = read_be_u32(bytes, 0);
+    *pcValue = static_cast<uint32_t>(pc);
+    *instructionWord = word;
+
+    if (instruction != nullptr)
+    {
+        if (!CoreDebuggerDecodeInstruction(*pcValue, word, *instruction))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool instruction_is_call_like(uint32_t instructionWord)
+{
+    const uint32_t opcode = instructionWord >> 26;
+    if (opcode == 0x03)
+    {
+        return true;
+    }
+
+    if (opcode == 0x00)
+    {
+        const uint32_t funct = instructionWord & 0x3F;
+        return funct == 0x09;
+    }
+
+    if (opcode == 0x01)
+    {
+        const uint32_t rt = (instructionWord >> 16) & 0x1F;
+        return rt == 0x10 || rt == 0x11 || rt == 0x12 || rt == 0x13;
+    }
+
+    return false;
 }
 
 std::string normalize_register_name(std::string name)
@@ -1286,6 +1346,258 @@ CORE_EXPORT bool CoreDebuggerStepInstructions(uint32_t count, uint32_t& currentP
                         0,
                         0,
                         0);
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerRunUntil(uint32_t address, uint32_t timeoutMs, uint32_t& currentPc, bool& hitTarget)
+{
+    if (!ensure_debugger_paused())
+    {
+        return false;
+    }
+
+    uint64_t startingPc = 0;
+    if (!CoreDebuggerReadCpuRegister("pc", startingPc))
+    {
+        return false;
+    }
+
+    currentPc = static_cast<uint32_t>(startingPc);
+    hitTarget = (currentPc == address);
+    if (hitTarget)
+    {
+        push_debugger_event("execution.run_until_completed",
+                            "Run-until target already matches the current PC",
+                            M64P_DBG_RUNSTATE_PAUSED,
+                            currentPc,
+                            address,
+                            address,
+                            0);
+        return true;
+    }
+
+    int temporaryBreakpointIndex = -1;
+    {
+        std::scoped_lock lock(g_breakpointMutex);
+        for (const CoreDebuggerBreakpoint& breakpoint : g_managedBreakpoints)
+        {
+            if (breakpoint.address == address &&
+                breakpoint.endAddress == address &&
+                (breakpoint.flags & M64P_BKP_FLAG_EXEC) != 0)
+            {
+                temporaryBreakpointIndex = -2;
+                break;
+            }
+        }
+    }
+
+    const auto cleanupTemporaryBreakpoint = [address, &temporaryBreakpointIndex]() {
+        if (temporaryBreakpointIndex < 0 ||
+            m64p::Debugger.DebugBreakpointCommand == nullptr)
+        {
+            return;
+        }
+
+        m64p::Debugger.DebugBreakpointCommand(M64P_BKP_CMD_REMOVE_IDX, temporaryBreakpointIndex, nullptr);
+
+        std::scoped_lock lock(g_breakpointMutex);
+        auto iterator = std::find_if(g_managedBreakpoints.begin(),
+                                     g_managedBreakpoints.end(),
+                                     [address](const CoreDebuggerBreakpoint& breakpoint) {
+                                         return breakpoint.address == address &&
+                                                breakpoint.endAddress == address &&
+                                                (breakpoint.flags & M64P_BKP_FLAG_EXEC) != 0;
+                                     });
+        if (iterator != g_managedBreakpoints.end())
+        {
+            g_managedBreakpoints.erase(iterator);
+        }
+
+        temporaryBreakpointIndex = -1;
+    };
+
+    if (temporaryBreakpointIndex == -1)
+    {
+        const uint32_t flags = M64P_BKP_FLAG_ENABLED | M64P_BKP_FLAG_EXEC;
+        if (!CoreDebuggerAddBreakpoint(address, address, flags, temporaryBreakpointIndex))
+        {
+            return false;
+        }
+    }
+
+    push_debugger_event("execution.run_until_requested",
+                        "Run-until requested through MCP bridge",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        currentPc,
+                        address,
+                        address,
+                        M64P_BKP_FLAG_EXEC);
+
+    if (!CoreDebuggerResumeExecution())
+    {
+        cleanupTemporaryBreakpoint();
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    int runState = M64P_DBG_RUNSTATE_RUNNING;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        runState = m64p::Debugger.DebugGetState(M64P_DBG_RUN_STATE);
+        if (runState == M64P_DBG_RUNSTATE_PAUSED)
+        {
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    runState = m64p::Debugger.DebugGetState(M64P_DBG_RUN_STATE);
+    if (runState != M64P_DBG_RUNSTATE_PAUSED)
+    {
+        if (!CoreDebuggerPauseExecution())
+        {
+            cleanupTemporaryBreakpoint();
+            return false;
+        }
+
+        const auto pauseDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (std::chrono::steady_clock::now() < pauseDeadline)
+        {
+            if (m64p::Debugger.DebugGetState(M64P_DBG_RUN_STATE) == M64P_DBG_RUNSTATE_PAUSED)
+            {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+
+    if (!CoreDebuggerReadCpuRegister("pc", startingPc))
+    {
+        cleanupTemporaryBreakpoint();
+        return false;
+    }
+
+    currentPc = static_cast<uint32_t>(startingPc);
+    hitTarget = (currentPc == address);
+
+    cleanupTemporaryBreakpoint();
+
+    push_debugger_event(hitTarget ? "execution.run_until_completed"
+                                  : "execution.run_until_stopped",
+                        hitTarget ? "Run-until completed at the requested address"
+                                  : "Run-until stopped before reaching the requested address",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        currentPc,
+                        address,
+                        address,
+                        M64P_BKP_FLAG_EXEC);
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerStepOver(uint32_t timeoutMs, uint32_t& currentPc, bool& steppedOverCall)
+{
+    if (!ensure_debugger_paused())
+    {
+        return false;
+    }
+
+    uint32_t instructionPc = 0;
+    uint32_t instructionWord = 0;
+    CoreDebuggerInstruction instruction;
+    if (!read_current_instruction(&instructionPc, &instructionWord, &instruction))
+    {
+        return false;
+    }
+
+    steppedOverCall = instruction_is_call_like(instructionWord);
+    if (!steppedOverCall)
+    {
+        return CoreDebuggerStepInstructions(1, currentPc);
+    }
+
+    const uint32_t targetAddress = instructionPc + 8;
+    bool hitTarget = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    do
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+        {
+            break;
+        }
+
+        const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        if (!CoreDebuggerRunUntil(targetAddress,
+                                  static_cast<uint32_t>(std::max<int64_t>(remainingMs, 1)),
+                                  currentPc,
+                                  hitTarget))
+        {
+            return false;
+        }
+    } while (!hitTarget);
+
+    push_debugger_event(hitTarget ? "execution.step_over_completed"
+                                  : "execution.step_over_stopped",
+                        hitTarget ? "Step-over completed at the post-call address"
+                                  : "Step-over stopped before reaching the post-call address",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        currentPc,
+                        targetAddress,
+                        targetAddress,
+                        M64P_BKP_FLAG_EXEC);
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerStepOut(uint32_t timeoutMs, uint32_t& currentPc, uint32_t& returnAddress, bool& hitTarget)
+{
+    if (!ensure_debugger_paused())
+    {
+        return false;
+    }
+
+    uint64_t ra = 0;
+    if (!CoreDebuggerReadCpuRegister("ra", ra))
+    {
+        return false;
+    }
+
+    returnAddress = static_cast<uint32_t>(ra);
+    if (returnAddress == 0)
+    {
+        CoreSetError("CoreDebuggerStepOut Failed: register ra is 0x00000000");
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    do
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+        {
+            break;
+        }
+
+        const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        if (!CoreDebuggerRunUntil(returnAddress,
+                                  static_cast<uint32_t>(std::max<int64_t>(remainingMs, 1)),
+                                  currentPc,
+                                  hitTarget))
+        {
+            return false;
+        }
+    } while (!hitTarget);
+
+    push_debugger_event(hitTarget ? "execution.step_out_completed"
+                                  : "execution.step_out_stopped",
+                        hitTarget ? "Step-out completed at the return address"
+                                  : "Step-out stopped before reaching the return address",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        currentPc,
+                        returnAddress,
+                        returnAddress,
+                        M64P_BKP_FLAG_EXEC);
     return true;
 }
 

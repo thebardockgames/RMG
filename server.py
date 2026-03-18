@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -20,6 +21,22 @@ DEFAULT_BRIDGE_TIMEOUT = float(os.environ.get("RMG_MCP_TIMEOUT_SECONDS", "2.0"))
 
 class BridgeProtocolError(RuntimeError):
     """Raised when the local RMG bridge returns an invalid payload."""
+
+
+def _flatten_json(prefix: str, value: Any, output: dict[str, Any]) -> None:
+    if isinstance(value, dict):
+        for key in sorted(value):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            _flatten_json(child_prefix, value[key], output)
+        return
+
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            child_prefix = f"{prefix}[{index}]"
+            _flatten_json(child_prefix, item, output)
+        return
+
+    output[prefix] = value
 
 
 def _normalize_hex(text: str, *, even_length: bool = False) -> str:
@@ -81,6 +98,114 @@ def _normalize_symbol_name(symbol_name: str) -> str:
     return normalized
 
 
+def _require_trace_path(path: str) -> str:
+    normalized = os.path.abspath(path.strip())
+    if not normalized:
+        raise ValueError("trace path must not be empty")
+    if not os.path.isfile(normalized):
+        raise FileNotFoundError(f"trace file does not exist: {normalized}")
+    return normalized
+
+
+def _load_jsonl_trace(path: str) -> list[dict[str, Any]]:
+    normalized_path = _require_trace_path(path)
+    events: list[dict[str, Any]] = []
+    with open(normalized_path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL in {normalized_path} at line {line_number}: {exc}") from exc
+
+            if not isinstance(payload, dict):
+                raise ValueError(f"invalid JSONL in {normalized_path} at line {line_number}: expected object")
+
+            events.append(payload)
+
+    return events
+
+
+def _trace_symbol_name(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+
+    name = value.get("name")
+    if isinstance(name, str) and name:
+        return name
+    return None
+
+
+def _trace_event_signature(
+    event: dict[str, Any],
+    *,
+    ignore_timestamps: bool,
+    ignore_event_ids: bool,
+) -> dict[str, Any]:
+    signature: dict[str, Any] = {
+        "type": event.get("type"),
+        "run_state": event.get("run_state"),
+        "pc": event.get("pc"),
+        "address": event.get("address"),
+        "end_address": event.get("end_address"),
+        "flags": event.get("flags"),
+        "kinds": event.get("kinds"),
+        "message": event.get("message"),
+        "pc_symbol": _trace_symbol_name(event.get("pc_symbol")),
+        "address_symbol": _trace_symbol_name(event.get("address_symbol")),
+    }
+
+    if not ignore_event_ids:
+        signature["id"] = event.get("id")
+    if not ignore_timestamps:
+        signature["timestamp_ms"] = event.get("timestamp_ms")
+
+    instruction = event.get("instruction")
+    if isinstance(instruction, dict):
+        signature["instruction"] = {
+            "address": instruction.get("address"),
+            "word": instruction.get("word"),
+            "mnemonic": instruction.get("mnemonic"),
+            "arguments": instruction.get("arguments"),
+            "text": instruction.get("text"),
+        }
+
+    return signature
+
+
+def _trace_type_counts(events: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        event_type = event.get("type")
+        if isinstance(event_type, str) and event_type:
+            counts[event_type] = counts.get(event_type, 0) + 1
+    return counts
+
+
+def _trace_summary(path: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    pcs = [event.get("pc") for event in events if isinstance(event.get("pc"), str)]
+    return {
+        "path": os.path.abspath(path),
+        "event_count": len(events),
+        "type_counts": _trace_type_counts(events),
+        "first_pc": pcs[0] if pcs else None,
+        "last_pc": pcs[-1] if pcs else None,
+    }
+
+
+def _diff_trace_signatures(left: dict[str, Any], right: dict[str, Any]) -> list[str]:
+    left_flat: dict[str, Any] = {}
+    right_flat: dict[str, Any] = {}
+    _flatten_json("", left, left_flat)
+    _flatten_json("", right, right_flat)
+
+    keys = sorted(set(left_flat) | set(right_flat))
+    return [key for key in keys if left_flat.get(key) != right_flat.get(key)]
+
+
 @dataclass(slots=True)
 class BridgeConfig:
     host: str = DEFAULT_BRIDGE_HOST
@@ -107,26 +232,27 @@ class RmgBridgeClient:
                 await self._ws.close()
                 self._ws = None
 
-    async def request(self, action: str, **payload: Any) -> dict[str, Any]:
+    async def request(self, action: str, timeout_seconds: float | None = None, **payload: Any) -> dict[str, Any]:
         async with self._lock:
-            return await self._request_locked(action, **payload)
+            return await self._request_locked(action, timeout_seconds=timeout_seconds, **payload)
 
-    async def _request_locked(self, action: str, **payload: Any) -> dict[str, Any]:
+    async def _request_locked(self, action: str, timeout_seconds: float | None = None, **payload: Any) -> dict[str, Any]:
         request_id = str(uuid.uuid4())
         request_body = {"id": request_id, "action": action, **payload}
+        effective_timeout = self._config.timeout_seconds if timeout_seconds is None else timeout_seconds
 
         await self._ensure_connected()
         assert self._ws is not None
 
         try:
-            await asyncio.wait_for(self._ws.send(json.dumps(request_body)), timeout=self._config.timeout_seconds)
-            raw_response = await self._recv_response_locked(request_id)
+            await asyncio.wait_for(self._ws.send(json.dumps(request_body)), timeout=effective_timeout)
+            raw_response = await self._recv_response_locked(request_id, timeout_seconds=effective_timeout)
         except ConnectionClosed:
             await self._reset_connection()
             await self._ensure_connected()
             assert self._ws is not None
-            await asyncio.wait_for(self._ws.send(json.dumps(request_body)), timeout=self._config.timeout_seconds)
-            raw_response = await self._recv_response_locked(request_id)
+            await asyncio.wait_for(self._ws.send(json.dumps(request_body)), timeout=effective_timeout)
+            raw_response = await self._recv_response_locked(request_id, timeout_seconds=effective_timeout)
 
         response = self._decode_response(raw_response)
         response_id = response.get("id")
@@ -140,11 +266,11 @@ class RmgBridgeClient:
 
         return response
 
-    async def _recv_response_locked(self, request_id: str) -> Any:
+    async def _recv_response_locked(self, request_id: str, timeout_seconds: float) -> Any:
         assert self._ws is not None
 
         while True:
-            raw_message = await asyncio.wait_for(self._ws.recv(), timeout=self._config.timeout_seconds)
+            raw_message = await asyncio.wait_for(self._ws.recv(), timeout=timeout_seconds)
             payload = self._decode_response(raw_message)
 
             if payload.get("type") == "event":
@@ -416,6 +542,32 @@ async def resume_emulation() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def reset_emulation(reset_type: str = "soft") -> dict[str, Any]:
+    """Reset the currently running ROM. Use soft for console-style reset or hard for full machine reset."""
+
+    normalized = reset_type.strip().lower()
+    if normalized not in {"soft", "hard"}:
+        raise ValueError("reset_type must be either 'soft' or 'hard'")
+
+    response = await bridge.request("reset_emulation", type=normalized)
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for reset_emulation")
+    return data
+
+
+@mcp.tool()
+async def restart_rom() -> dict[str, Any]:
+    """Shut down and relaunch the current ROM through RMG's normal startup path."""
+
+    response = await bridge.request("restart_rom", timeout_seconds=max(bridge._config.timeout_seconds, 10.0))
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for restart_rom")
+    return data
+
+
+@mcp.tool()
 async def step_instruction(count: int = 1) -> dict[str, Any]:
     """Execute one or more MIPS instructions while the debugger is paused."""
 
@@ -426,6 +578,81 @@ async def step_instruction(count: int = 1) -> dict[str, Any]:
     data = response.get("data")
     if not isinstance(data, dict):
         raise BridgeProtocolError("Bridge returned a non-object payload for step_instruction")
+    return data
+
+
+@mcp.tool()
+async def step_over(timeout_ms: int = 5000) -> dict[str, Any]:
+    """Advance past the current instruction, running through a call if the current opcode links and branches."""
+
+    if timeout_ms <= 0:
+        raise ValueError("timeout_ms must be greater than zero")
+
+    response = await bridge.request(
+        "step_over",
+        timeout_seconds=max(bridge._config.timeout_seconds, (timeout_ms / 1000.0) + 1.0),
+        timeout_ms=timeout_ms,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for step_over")
+    return data
+
+
+@mcp.tool()
+async def step_out(timeout_ms: int = 5000) -> dict[str, Any]:
+    """Run until the current function returns to the address stored in $ra."""
+
+    if timeout_ms <= 0:
+        raise ValueError("timeout_ms must be greater than zero")
+
+    response = await bridge.request(
+        "step_out",
+        timeout_seconds=max(bridge._config.timeout_seconds, (timeout_ms / 1000.0) + 1.0),
+        timeout_ms=timeout_ms,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for step_out")
+    return data
+
+
+@mcp.tool()
+async def run_until_address(address_hex: str, timeout_ms: int = 5000) -> dict[str, Any]:
+    """Resume execution until the CPU reaches a target address or the timeout expires."""
+
+    if timeout_ms <= 0:
+        raise ValueError("timeout_ms must be greater than zero")
+
+    response = await bridge.request(
+        "run_until",
+        timeout_seconds=max(bridge._config.timeout_seconds, (timeout_ms / 1000.0) + 1.0),
+        address=_normalize_hex(address_hex),
+        timeout_ms=timeout_ms,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for run_until")
+    return data
+
+
+@mcp.tool()
+async def run_until_symbol(symbol_name: str, offset_bytes: int = 0, timeout_ms: int = 5000) -> dict[str, Any]:
+    """Resume execution until the CPU reaches an exact loaded symbol plus an optional byte offset."""
+
+    if timeout_ms <= 0:
+        raise ValueError("timeout_ms must be greater than zero")
+
+    response = await bridge.request(
+        "run_until",
+        timeout_seconds=max(bridge._config.timeout_seconds, (timeout_ms / 1000.0) + 1.0),
+        symbol=_normalize_symbol_name(symbol_name),
+        offset=offset_bytes,
+        timeout_ms=timeout_ms,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for run_until_symbol")
     return data
 
 
@@ -687,6 +914,8 @@ async def get_debug_events(
     since_id: int = 0,
     limit: int = 100,
     event_types: str = "",
+    pc_start_hex: str = "",
+    pc_end_hex: str = "",
 ) -> dict[str, Any]:
     """Fetch structured debugger events such as breakpoint hits, watchpoint hits, stepping and symbol loading."""
 
@@ -701,12 +930,179 @@ async def get_debug_events(
     }
     if event_types.strip():
         payload["event_types"] = event_types
+    if pc_start_hex.strip() or pc_end_hex.strip():
+        if not pc_start_hex.strip() or not pc_end_hex.strip():
+            raise ValueError("pc_start_hex and pc_end_hex must be provided together")
+        payload["pc_start"] = _normalize_hex(pc_start_hex)
+        payload["pc_end"] = _normalize_hex(pc_end_hex)
 
     response = await bridge.request("get_debug_events", **payload)
     data = response.get("data")
     if not isinstance(data, dict):
         raise BridgeProtocolError("Bridge returned a non-object payload for get_debug_events")
     return data
+
+
+@mcp.tool()
+async def capture_instruction_trace(
+    duration_ms: int = 1000,
+    poll_interval_ms: int = 25,
+    event_types: str = "debugger.update,execution.step,debugger.breakpoint_hit,debugger.watchpoint_hit,execution.run_until_completed,execution.run_until_stopped",
+    pc_start_hex: str = "",
+    pc_end_hex: str = "",
+    output_path: str = "",
+) -> dict[str, Any]:
+    """Poll structured execution events for a short time window and optionally export them as JSONL."""
+
+    if duration_ms <= 0:
+        raise ValueError("duration_ms must be greater than zero")
+    if poll_interval_ms <= 0:
+        raise ValueError("poll_interval_ms must be greater than zero")
+
+    initial = await get_debug_events(limit=1)
+    latest = initial.get("latest_id", "0")
+    try:
+        since_id = int(str(latest))
+    except ValueError as exc:
+        raise BridgeProtocolError("Bridge returned a non-integer latest_id") from exc
+
+    deadline = time.monotonic() + (duration_ms / 1000.0)
+    collected: list[dict[str, Any]] = []
+
+    while time.monotonic() < deadline:
+        batch = await get_debug_events(
+            since_id=since_id,
+            limit=512,
+            event_types=event_types,
+            pc_start_hex=pc_start_hex,
+            pc_end_hex=pc_end_hex,
+        )
+
+        events = batch.get("events")
+        if not isinstance(events, list):
+            raise BridgeProtocolError("Bridge returned a non-array events payload for capture_instruction_trace")
+
+        for event in events:
+            if isinstance(event, dict):
+                collected.append(event)
+
+        latest = batch.get("latest_id", since_id)
+        try:
+            since_id = int(str(latest))
+        except ValueError as exc:
+            raise BridgeProtocolError("Bridge returned a non-integer latest_id during capture_instruction_trace") from exc
+
+        await asyncio.sleep(poll_interval_ms / 1000.0)
+
+    export_summary: dict[str, Any] | None = None
+    if output_path.strip():
+        normalized_output = os.path.abspath(output_path.strip())
+        output_dir = os.path.dirname(normalized_output)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(normalized_output, "w", encoding="utf-8", newline="\n") as handle:
+            for event in collected:
+                handle.write(json.dumps(event, ensure_ascii=True))
+                handle.write("\n")
+
+        export_summary = {
+            "path": normalized_output,
+            "format": "jsonl",
+            "written_events": len(collected),
+        }
+
+    return {
+        "event_count": len(collected),
+        "latest_id": since_id,
+        "duration_ms": duration_ms,
+        "poll_interval_ms": poll_interval_ms,
+        "event_types": event_types,
+        "pc_start_hex": pc_start_hex.strip() or None,
+        "pc_end_hex": pc_end_hex.strip() or None,
+        "events": collected,
+        "export": export_summary,
+    }
+
+
+@mcp.tool()
+async def compare_trace_files(
+    trace_a_path: str,
+    trace_b_path: str,
+    max_differences: int = 20,
+    ignore_timestamps: bool = True,
+    ignore_event_ids: bool = True,
+) -> dict[str, Any]:
+    """Compare two JSONL trace files and report the first useful divergences for recompilation work."""
+
+    if max_differences <= 0:
+        raise ValueError("max_differences must be greater than zero")
+
+    trace_a = _load_jsonl_trace(trace_a_path)
+    trace_b = _load_jsonl_trace(trace_b_path)
+
+    summary_a = _trace_summary(trace_a_path, trace_a)
+    summary_b = _trace_summary(trace_b_path, trace_b)
+
+    common_prefix = 0
+    divergences: list[dict[str, Any]] = []
+
+    compare_count = min(len(trace_a), len(trace_b))
+    for index in range(compare_count):
+        left_signature = _trace_event_signature(
+            trace_a[index],
+            ignore_timestamps=ignore_timestamps,
+            ignore_event_ids=ignore_event_ids,
+        )
+        right_signature = _trace_event_signature(
+            trace_b[index],
+            ignore_timestamps=ignore_timestamps,
+            ignore_event_ids=ignore_event_ids,
+        )
+
+        if left_signature == right_signature:
+            common_prefix += 1
+            continue
+
+        divergences.append(
+            {
+                "index": index,
+                "differing_fields": _diff_trace_signatures(left_signature, right_signature),
+                "trace_a": left_signature,
+                "trace_b": right_signature,
+            }
+        )
+        if len(divergences) >= max_differences:
+            break
+
+    tail_difference: dict[str, Any] | None = None
+    if len(trace_a) != len(trace_b):
+        if len(trace_a) > len(trace_b):
+            tail_difference = {
+                "trace": "a",
+                "extra_events": len(trace_a) - len(trace_b),
+                "first_extra_index": len(trace_b),
+            }
+        else:
+            tail_difference = {
+                "trace": "b",
+                "extra_events": len(trace_b) - len(trace_a),
+                "first_extra_index": len(trace_a),
+            }
+
+    exact_match = common_prefix == compare_count and len(trace_a) == len(trace_b)
+
+    return {
+        "exact_match": exact_match,
+        "common_prefix_events": common_prefix,
+        "compared_events": compare_count,
+        "same_length": len(trace_a) == len(trace_b),
+        "trace_a": summary_a,
+        "trace_b": summary_b,
+        "tail_difference": tail_difference,
+        "divergence_count": len(divergences),
+        "first_divergence_index": divergences[0]["index"] if divergences else None,
+        "divergences": divergences,
+    }
 
 
 @mcp.tool()

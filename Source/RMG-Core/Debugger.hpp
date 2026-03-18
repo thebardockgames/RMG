@@ -99,6 +99,9 @@ bool CoreDebuggerDisassemble(uint32_t address, uint32_t instructionCount, std::v
 bool CoreDebuggerPauseExecution(void);
 bool CoreDebuggerResumeExecution(void);
 bool CoreDebuggerStepInstructions(uint32_t count, uint32_t& currentPc);
+bool CoreDebuggerRunUntil(uint32_t address, uint32_t timeoutMs, uint32_t& currentPc, bool& hitTarget);
+bool CoreDebuggerStepOver(uint32_t timeoutMs, uint32_t& currentPc, bool& steppedOverCall);
+bool CoreDebuggerStepOut(uint32_t timeoutMs, uint32_t& currentPc, uint32_t& returnAddress, bool& hitTarget);
 bool CoreDebuggerAddBreakpoint(uint32_t address, uint32_t endAddress, uint32_t flags, int& breakpointIndex);
 bool CoreDebuggerRemoveBreakpoint(uint32_t address);
 bool CoreDebuggerListBreakpoints(std::vector<CoreDebuggerBreakpoint>& breakpoints);

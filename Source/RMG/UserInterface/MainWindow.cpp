@@ -71,6 +71,7 @@
 #include <RMG-Core/Screenshot.hpp>
 #include <RMG-Core/Emulation.hpp>
 #include <RMG-Core/SaveState.hpp>
+#include <RMG-Core/Rom.hpp>
 #include <RMG-Core/Settings.hpp>
 #include <RMG-Core/Netplay.hpp>
 #include <RMG-Core/Version.hpp>
@@ -151,6 +152,9 @@ bool MainWindow::Init(QApplication* app, bool showUI, bool launchROM)
     this->mcpBridgeServer = new MCP::McpBridgeServer(8765, this);
     connect(this->mcpBridgeServer, &MCP::McpBridgeServer::ServerError, this, [this](const QString& message) {
         CoreAddCallbackMessage(CoreDebugMessageType::Warning, "[MCP] " + message.toStdString());
+    });
+    this->mcpBridgeServer->SetRestartRomHandler([this](QString* errorMessage) {
+        return this->restartCurrentRom(errorMessage);
     });
 
     if (this->mcpBridgeServer->Start())
@@ -824,9 +828,47 @@ void MainWindow::launchEmulationThread(QString cartRom, QString diskRom, bool re
         this->ui_ShowStatusbar = CoreSettingsGetBoolValue(SettingsID::GUI_StatusBar);
     }
 
+    this->ui_CurrentCartRom = cartRom;
+    this->ui_CurrentDiskRom = diskRom;
     this->emulationThread->SetRomFile(cartRom);
     this->emulationThread->SetDiskFile(diskRom);
     this->emulationThread->start();
+}
+
+bool MainWindow::restartCurrentRom(QString* errorMessage)
+{
+    if (CoreHasInitNetplay())
+    {
+        if (errorMessage != nullptr)
+        {
+            *errorMessage = QStringLiteral("restart_rom is not supported while netplay is active");
+        }
+
+        return false;
+    }
+
+    if (this->ui_CurrentCartRom.isEmpty())
+    {
+        std::filesystem::path romPath;
+        if (CoreHasRomOpen() && CoreGetRomPath(romPath))
+        {
+            this->ui_CurrentCartRom = QString::fromStdString(romPath.string());
+        }
+    }
+
+    if (this->ui_CurrentCartRom.isEmpty())
+    {
+        if (errorMessage != nullptr)
+        {
+            *errorMessage = QStringLiteral("No current ROM is available to restart");
+        }
+
+        return false;
+    }
+
+    this->updateUI(true, false);
+    this->launchEmulationThread(this->ui_CurrentCartRom, this->ui_CurrentDiskRom, false, -1, false, true);
+    return true;
 }
 
 void MainWindow::updateActions(bool inEmulation, bool isPaused)

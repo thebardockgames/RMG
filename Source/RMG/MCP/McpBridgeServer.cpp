@@ -18,6 +18,7 @@
 #include <QWebSocketServer>
 
 #include <RMG-Core/Debugger.hpp>
+#include <RMG-Core/Emulation.hpp>
 #include <RMG-Core/Error.hpp>
 #include <RMG-Core/m64p/api/m64p_types.h>
 
@@ -32,6 +33,7 @@ namespace
 constexpr quint32 kMaxReadSize = 4096;
 constexpr quint32 kMaxDisassemblyInstructions = 256;
 constexpr quint32 kMaxStepCount = 1024;
+constexpr quint32 kMaxRunUntilTimeoutMs = 30000;
 constexpr quint32 kMaxSymbolLookupResults = 128;
 constexpr quint32 kMaxEventResults = 512;
 
@@ -42,6 +44,14 @@ struct ResolvedRequestTarget
     QString symbolName;
     qint64 offset = 0;
     CoreDebuggerSymbol symbol;
+};
+
+struct EventRequestFilter
+{
+    QStringList typeFilters;
+    bool hasPcRange = false;
+    quint32 pcStart = 0;
+    quint32 pcEnd = 0;
 };
 
 QString firstNonEmptyField(const QJsonObject& request, std::initializer_list<const char*> keys)
@@ -497,7 +507,7 @@ QString requestRegisterName(const QJsonObject& request)
     return registerName.trimmed();
 }
 
-QStringList requestEventTypeFilter(const QJsonObject& request)
+QStringList requestEventTypeFilters(const QJsonObject& request)
 {
     QStringList filters;
 
@@ -543,23 +553,113 @@ QStringList requestEventTypeFilter(const QJsonObject& request)
     return filters;
 }
 
-bool eventMatchesFilters(const CoreDebuggerEvent& event, const QStringList& filters)
+bool tryParseEventRange(const QJsonObject& request,
+                        const QString& startKey,
+                        const QString& endKey,
+                        bool* hasRange,
+                        quint32* start,
+                        quint32* end,
+                        QString* error)
 {
-    if (filters.isEmpty())
+    if (hasRange == nullptr || start == nullptr || end == nullptr)
+    {
+        return false;
+    }
+
+    *hasRange = false;
+    *start = 0;
+    *end = 0;
+
+    const QJsonValue startValue = request.value(startKey);
+    const QJsonValue endValue = request.value(endKey);
+    if (startValue.isUndefined() && endValue.isUndefined())
     {
         return true;
     }
 
-    const QString eventType = QString::fromStdString(event.type);
-    for (const QString& filter : filters)
+    QString parsedStartText = startValue.toString().trimmed();
+    QString parsedEndText = endValue.toString().trimmed();
+
+    if (parsedStartText.isEmpty() || parsedEndText.isEmpty())
     {
-        if (eventType.contains(filter, Qt::CaseInsensitive))
+        if (error != nullptr)
         {
-            return true;
+            *error = QStringLiteral("PC range filters require both %1 and %2").arg(startKey, endKey);
+        }
+        return false;
+    }
+
+    if (!tryParseHexU32Local(parsedStartText, start) ||
+        !tryParseHexU32Local(parsedEndText, end))
+    {
+        if (error != nullptr)
+        {
+            *error = QStringLiteral("Invalid PC range. Expected hexadecimal addresses in %1 and %2")
+                         .arg(startKey, endKey);
+        }
+        return false;
+    }
+
+    if (*end < *start)
+    {
+        if (error != nullptr)
+        {
+            *error = QStringLiteral("Invalid PC range. %1 must be less than or equal to %2")
+                         .arg(startKey, endKey);
+        }
+        return false;
+    }
+
+    *hasRange = true;
+    return true;
+}
+
+bool buildEventRequestFilter(const QJsonObject& request, EventRequestFilter* filter, QString* error)
+{
+    if (filter == nullptr)
+    {
+        return false;
+    }
+
+    *filter = {};
+    filter->typeFilters = requestEventTypeFilters(request);
+    return tryParseEventRange(request,
+                              QStringLiteral("pc_start"),
+                              QStringLiteral("pc_end"),
+                              &filter->hasPcRange,
+                              &filter->pcStart,
+                              &filter->pcEnd,
+                              error);
+}
+
+bool eventMatchesFilters(const CoreDebuggerEvent& event, const EventRequestFilter& filters)
+{
+    if (!filters.typeFilters.isEmpty())
+    {
+        const QString eventType = QString::fromStdString(event.type);
+        bool matchedType = false;
+        for (const QString& filter : filters.typeFilters)
+        {
+            if (eventType.contains(filter, Qt::CaseInsensitive))
+            {
+                matchedType = true;
+                break;
+            }
+        }
+
+        if (!matchedType)
+        {
+            return false;
         }
     }
 
-    return false;
+    if (filters.hasPcRange &&
+        (event.pc < filters.pcStart || event.pc > filters.pcEnd))
+    {
+        return false;
+    }
+
+    return true;
 }
 } // namespace
 
@@ -639,6 +739,11 @@ bool McpBridgeServer::IsRunning(void) const
 quint16 McpBridgeServer::Port(void) const
 {
     return this->port;
+}
+
+void McpBridgeServer::SetRestartRomHandler(std::function<bool(QString*)> handler)
+{
+    this->restartRomHandler = std::move(handler);
 }
 
 void McpBridgeServer::onNewConnection(void)
@@ -728,7 +833,12 @@ void McpBridgeServer::broadcastEvent(const CoreDebuggerEvent& event) const
             continue;
         }
 
-        if (!eventMatchesFilters(event, subscription.filters))
+        EventRequestFilter filter;
+        filter.typeFilters = subscription.typeFilters;
+        filter.hasPcRange = subscription.hasPcRange;
+        filter.pcStart = subscription.pcStart;
+        filter.pcEnd = subscription.pcEnd;
+        if (!eventMatchesFilters(event, filter))
         {
             continue;
         }
@@ -829,9 +939,34 @@ QJsonObject McpBridgeServer::processRequest(const QJsonObject& request) const
         return this->handleResumeExecution(request);
     }
 
+    if (action == QStringLiteral("reset_emulation"))
+    {
+        return this->handleResetEmulation(request);
+    }
+
+    if (action == QStringLiteral("restart_rom"))
+    {
+        return this->handleRestartRom(request);
+    }
+
     if (action == QStringLiteral("step_instruction"))
     {
         return this->handleStepInstruction(request);
+    }
+
+    if (action == QStringLiteral("run_until"))
+    {
+        return this->handleRunUntil(request);
+    }
+
+    if (action == QStringLiteral("step_over"))
+    {
+        return this->handleStepOver(request);
+    }
+
+    if (action == QStringLiteral("step_out"))
+    {
+        return this->handleStepOut(request);
     }
 
     if (action == QStringLiteral("add_breakpoint"))
@@ -1228,6 +1363,81 @@ QJsonObject McpBridgeServer::handleResumeExecution(const QJsonObject& request) c
     return makeOkResponse(request, QJsonObject{{QStringLiteral("run_state"), QStringLiteral("running")}});
 }
 
+QJsonObject McpBridgeServer::handleResetEmulation(const QJsonObject& request) const
+{
+    QString resetType = request.value(QStringLiteral("type")).toString().trimmed().toLower();
+    if (resetType.isEmpty())
+    {
+        resetType = request.value(QStringLiteral("kind")).toString().trimmed().toLower();
+    }
+
+    bool hard = request.value(QStringLiteral("hard")).toBool(false);
+    if (!resetType.isEmpty())
+    {
+        if (resetType == QStringLiteral("soft"))
+        {
+            hard = false;
+        }
+        else if (resetType == QStringLiteral("hard"))
+        {
+            hard = true;
+        }
+        else
+        {
+            return makeErrorResponse(request, QStringLiteral("Unsupported reset type: %1").arg(resetType));
+        }
+    }
+
+    if (!CoreResetEmulation(hard))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    QString runState = QStringLiteral("unknown");
+    if (CoreIsEmulationPaused())
+    {
+        runState = QStringLiteral("paused");
+    }
+    else if (CoreIsEmulationRunning())
+    {
+        runState = QStringLiteral("running");
+    }
+    else
+    {
+        runState = QStringLiteral("stopped");
+    }
+
+    QJsonObject payload{
+        {QStringLiteral("reset_type"), hard ? QStringLiteral("hard") : QStringLiteral("soft")},
+        {QStringLiteral("hard"), hard},
+        {QStringLiteral("run_state"), runState},
+    };
+    return makeOkResponse(request, payload);
+}
+
+QJsonObject McpBridgeServer::handleRestartRom(const QJsonObject& request) const
+{
+    if (!this->restartRomHandler)
+    {
+        return makeErrorResponse(request, QStringLiteral("ROM restart handler is not configured"));
+    }
+
+    QString errorMessage;
+    if (!this->restartRomHandler(&errorMessage))
+    {
+        if (errorMessage.isEmpty())
+        {
+            errorMessage = QStringLiteral("Current ROM restart request was rejected");
+        }
+        return makeErrorResponse(request, errorMessage);
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("status"), QStringLiteral("restart_requested")},
+                          });
+}
+
 QJsonObject McpBridgeServer::handleStepInstruction(const QJsonObject& request) const
 {
     int countValue = request.value(QStringLiteral("count")).toInt(1);
@@ -1249,6 +1459,100 @@ QJsonObject McpBridgeServer::handleStepInstruction(const QJsonObject& request) c
                               {QStringLiteral("count"), countValue},
                               {QStringLiteral("pc"), u32ToHexString(pc)},
                               {QStringLiteral("run_state"), QStringLiteral("paused")},
+                          });
+}
+
+QJsonObject McpBridgeServer::handleRunUntil(const QJsonObject& request) const
+{
+    QString errorMessage;
+    ResolvedRequestTarget target;
+    if (!resolveRequestTarget(request,
+                              {"address", "address_hex"},
+                              {"symbol", "symbol_name", "name"},
+                              {"offset", "offset_bytes", "offset_hex"},
+                              &target,
+                              &errorMessage))
+    {
+        return makeErrorResponse(request, errorMessage);
+    }
+
+    int timeoutMs = request.value(QStringLiteral("timeout_ms")).toInt(5000);
+    if (timeoutMs <= 0 || timeoutMs > static_cast<int>(kMaxRunUntilTimeoutMs))
+    {
+        return makeErrorResponse(request,
+                                 QStringLiteral("Invalid timeout_ms. Expected 1..%1.")
+                                     .arg(static_cast<int>(kMaxRunUntilTimeoutMs)));
+    }
+
+    quint32 currentPc = 0;
+    bool hitTarget = false;
+    if (!CoreDebuggerRunUntil(target.address, static_cast<uint32_t>(timeoutMs), currentPc, hitTarget))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("target"), u32ToHexString(target.address)},
+                              {QStringLiteral("pc"), u32ToHexString(currentPc)},
+                              {QStringLiteral("hit_target"), hitTarget},
+                              {QStringLiteral("run_state"), QStringLiteral("paused")},
+                              {QStringLiteral("timeout_ms"), timeoutMs},
+                              {QStringLiteral("requested_target"), resolvedRequestTargetToJson(target)},
+                          });
+}
+
+QJsonObject McpBridgeServer::handleStepOver(const QJsonObject& request) const
+{
+    int timeoutMs = request.value(QStringLiteral("timeout_ms")).toInt(5000);
+    if (timeoutMs <= 0 || timeoutMs > static_cast<int>(kMaxRunUntilTimeoutMs))
+    {
+        return makeErrorResponse(request,
+                                 QStringLiteral("Invalid timeout_ms. Expected 1..%1.")
+                                     .arg(static_cast<int>(kMaxRunUntilTimeoutMs)));
+    }
+
+    quint32 currentPc = 0;
+    bool steppedOverCall = false;
+    if (!CoreDebuggerStepOver(static_cast<uint32_t>(timeoutMs), currentPc, steppedOverCall))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("pc"), u32ToHexString(currentPc)},
+                              {QStringLiteral("stepped_over_call"), steppedOverCall},
+                              {QStringLiteral("run_state"), QStringLiteral("paused")},
+                              {QStringLiteral("timeout_ms"), timeoutMs},
+                          });
+}
+
+QJsonObject McpBridgeServer::handleStepOut(const QJsonObject& request) const
+{
+    int timeoutMs = request.value(QStringLiteral("timeout_ms")).toInt(5000);
+    if (timeoutMs <= 0 || timeoutMs > static_cast<int>(kMaxRunUntilTimeoutMs))
+    {
+        return makeErrorResponse(request,
+                                 QStringLiteral("Invalid timeout_ms. Expected 1..%1.")
+                                     .arg(static_cast<int>(kMaxRunUntilTimeoutMs)));
+    }
+
+    quint32 currentPc = 0;
+    quint32 returnAddress = 0;
+    bool hitTarget = false;
+    if (!CoreDebuggerStepOut(static_cast<uint32_t>(timeoutMs), currentPc, returnAddress, hitTarget))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("pc"), u32ToHexString(currentPc)},
+                              {QStringLiteral("return_address"), u32ToHexString(returnAddress)},
+                              {QStringLiteral("hit_target"), hitTarget},
+                              {QStringLiteral("run_state"), QStringLiteral("paused")},
+                              {QStringLiteral("timeout_ms"), timeoutMs},
                           });
 }
 
@@ -1582,11 +1886,16 @@ QJsonObject McpBridgeServer::handleGetDebugEvents(const QJsonObject& request) co
                                      .arg(static_cast<int>(kMaxEventResults)));
     }
 
-    QStringList filters = requestEventTypeFilter(request);
+    EventRequestFilter filters;
+    QString errorMessage;
+    if (!buildEventRequestFilter(request, &filters, &errorMessage))
+    {
+        return makeErrorResponse(request, errorMessage);
+    }
 
     std::vector<CoreDebuggerEvent> events;
     uint64_t latestId = 0;
-    const uint32_t fetchLimit = filters.isEmpty()
+    const uint32_t fetchLimit = filters.typeFilters.isEmpty() && !filters.hasPcRange
                                     ? static_cast<uint32_t>(limitValue)
                                     : static_cast<uint32_t>(kMaxEventResults);
     if (!CoreDebuggerGetEvents(sinceId, fetchLimit, events, latestId))
@@ -1630,7 +1939,17 @@ QJsonObject McpBridgeServer::handleConfigureEventStream(const QJsonObject& reque
     {
         EventStreamSubscription subscription;
         subscription.includeVi = request.value(QStringLiteral("include_vi")).toBool(false);
-        subscription.filters = requestEventTypeFilter(request);
+        EventRequestFilter filters;
+        QString errorMessage;
+        if (!buildEventRequestFilter(request, &filters, &errorMessage))
+        {
+            return makeErrorResponse(request, errorMessage);
+        }
+
+        subscription.typeFilters = filters.typeFilters;
+        subscription.hasPcRange = filters.hasPcRange;
+        subscription.pcStart = filters.pcStart;
+        subscription.pcEnd = filters.pcEnd;
         this->eventSubscribers.insert(socket, subscription);
 
         CoreDebuggerEventStats stats;
@@ -1647,8 +1966,14 @@ QJsonObject McpBridgeServer::handleConfigureEventStream(const QJsonObject& reque
                               {QStringLiteral("enabled"), enabled},
                               {QStringLiteral("subscriber_count"), this->eventSubscribers.size()},
                               {QStringLiteral("include_vi"), enabled ? this->eventSubscribers.value(socket).includeVi : false},
-                              {QStringLiteral("filters"), QJsonArray::fromStringList(enabled ? this->eventSubscribers.value(socket).filters
+                              {QStringLiteral("filters"), QJsonArray::fromStringList(enabled ? this->eventSubscribers.value(socket).typeFilters
                                                                                            : QStringList{})},
+                              {QStringLiteral("pc_start"), enabled && this->eventSubscribers.value(socket).hasPcRange
+                                                                ? u32ToHexString(this->eventSubscribers.value(socket).pcStart)
+                                                                : QString()},
+                              {QStringLiteral("pc_end"), enabled && this->eventSubscribers.value(socket).hasPcRange
+                                                              ? u32ToHexString(this->eventSubscribers.value(socket).pcEnd)
+                                                              : QString()},
                               {QStringLiteral("streaming"), !this->eventSubscribers.isEmpty()},
                           });
 }
@@ -1850,7 +2175,42 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
     CoreDebuggerResolvedSymbol addressSymbol;
     CoreDebuggerResolveSymbol(event.address, addressSymbol);
 
-    return QJsonObject{
+    QJsonObject instructionPayload;
+    quint32 pcPhysicalAddress = 0;
+    if (event.pc != 0)
+    {
+        if (CoreDebuggerVirtualToPhysical(event.pc, pcPhysicalAddress))
+        {
+            instructionPayload.insert(QStringLiteral("physical_address"), u32ToHexString(pcPhysicalAddress));
+        }
+
+        std::vector<uint8_t> bytes;
+        if (CoreDebuggerReadMemory(event.pc, 4, bytes) && bytes.size() == 4)
+        {
+            quint32 instructionWord = (static_cast<quint32>(bytes[0]) << 24) |
+                                      (static_cast<quint32>(bytes[1]) << 16) |
+                                      (static_cast<quint32>(bytes[2]) << 8) |
+                                      static_cast<quint32>(bytes[3]);
+
+            CoreDebuggerInstruction instruction;
+            if (CoreDebuggerDecodeInstruction(event.pc, instructionWord, instruction))
+            {
+                const QString mnemonic = QString::fromStdString(instruction.mnemonic);
+                const QString arguments = QString::fromStdString(instruction.arguments);
+
+                instructionPayload.insert(QStringLiteral("address"), u32ToHexString(instruction.address));
+                instructionPayload.insert(QStringLiteral("word"), u32ToHexString(instruction.word));
+                instructionPayload.insert(QStringLiteral("mnemonic"), mnemonic);
+                instructionPayload.insert(QStringLiteral("arguments"), arguments);
+                instructionPayload.insert(QStringLiteral("text"),
+                                          arguments.isEmpty()
+                                              ? mnemonic
+                                              : QStringLiteral("%1 %2").arg(mnemonic, arguments));
+            }
+        }
+    }
+
+    QJsonObject payload{
         {QStringLiteral("id"), QString::number(event.id)},
         {QStringLiteral("timestamp_ms"), QString::number(event.timestampMs)},
         {QStringLiteral("type"), QString::fromStdString(event.type)},
@@ -1865,6 +2225,13 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
         {QStringLiteral("flags"), breakpointFlagsToString(event.flags)},
         {QStringLiteral("kinds"), breakpointKindsToJson(event.flags)},
     };
+
+    if (!instructionPayload.isEmpty())
+    {
+        payload.insert(QStringLiteral("instruction"), instructionPayload);
+    }
+
+    return payload;
 }
 
 QJsonArray McpBridgeServer::instructionListToJson(const QJsonArray& instructions)

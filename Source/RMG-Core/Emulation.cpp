@@ -390,18 +390,11 @@ CORE_EXPORT bool CoreResetEmulation(bool hard)
         return false;
     }
 
-    if (CoreIsEmulationPaused())
+    if (!CoreIsEmulationRunning() &&
+        !CoreIsEmulationPaused())
     {
         error = "CoreResetEmulation Failed: ";
-        error += "cannot reset emulation when paused!";
-        CoreSetError(error);
-        return false;
-    }
-
-    if (!CoreIsEmulationRunning())
-    {
-        error = "CoreResetEmulation Failed: ";
-        error += "cannot reset emulation when emulation isn't running!";
+        error += "cannot reset emulation when emulation isn't running or paused!";
         CoreSetError(error);
         return false;
     }

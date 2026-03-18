@@ -126,6 +126,8 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     int ui_LoadSaveStateSlotTimerId = -1;
 
     QString ui_WindowTitle;
+    QString ui_CurrentCartRom;
+    QString ui_CurrentDiskRom;
 
     Dialog::LogDialog logDialog;
 #ifdef NETPLAY
@@ -152,6 +154,7 @@ class MainWindow : public QMainWindow, private Ui::MainWindow
     void connectEmulationThreadSignals(void);
     void launchEmulationThread(QString cartRom, QString address, int port, int player);
     void launchEmulationThread(QString cartRom, QString diskRom = "", bool refreshRomListAfterEmulation = false, int slot = -1, bool netplay = false, bool dragdrop = false);
+    bool restartCurrentRom(QString* errorMessage = nullptr);
 
     QString getSaveStateSlotDateTimeText(QAction* action);
     QString getSaveStateSlotText(QAction* action, int slot);
