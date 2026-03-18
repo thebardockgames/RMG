@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,26 @@ def _normalize_breakpoint_kind(kind: str) -> str:
     return aliases[normalized]
 
 
+def _normalize_watchpoint_access(access: str) -> list[str]:
+    normalized = access.strip().lower().replace("-", "_")
+    aliases = {
+        "r": ["read"],
+        "read": ["read"],
+        "w": ["write"],
+        "write": ["write"],
+        "rw": ["read", "write"],
+        "wr": ["read", "write"],
+        "read_write": ["read", "write"],
+        "write_read": ["read", "write"],
+        "x": ["execute"],
+        "exec": ["execute"],
+        "execute": ["execute"],
+    }
+    if normalized not in aliases:
+        raise ValueError("access must be one of: read, write, read_write, execute")
+    return aliases[normalized]
+
+
 @dataclass(slots=True)
 class BridgeConfig:
     host: str = DEFAULT_BRIDGE_HOST
@@ -71,6 +92,7 @@ class RmgBridgeClient:
         self._config = config
         self._lock = asyncio.Lock()
         self._ws: Any | None = None
+        self._event_buffer: deque[dict[str, Any]] = deque(maxlen=1024)
 
     async def close(self) -> None:
         async with self._lock:
@@ -91,13 +113,13 @@ class RmgBridgeClient:
 
         try:
             await asyncio.wait_for(self._ws.send(json.dumps(request_body)), timeout=self._config.timeout_seconds)
-            raw_response = await asyncio.wait_for(self._ws.recv(), timeout=self._config.timeout_seconds)
+            raw_response = await self._recv_response_locked(request_id)
         except ConnectionClosed:
             await self._reset_connection()
             await self._ensure_connected()
             assert self._ws is not None
             await asyncio.wait_for(self._ws.send(json.dumps(request_body)), timeout=self._config.timeout_seconds)
-            raw_response = await asyncio.wait_for(self._ws.recv(), timeout=self._config.timeout_seconds)
+            raw_response = await self._recv_response_locked(request_id)
 
         response = self._decode_response(raw_response)
         response_id = response.get("id")
@@ -111,6 +133,25 @@ class RmgBridgeClient:
 
         return response
 
+    async def _recv_response_locked(self, request_id: str) -> Any:
+        assert self._ws is not None
+
+        while True:
+            raw_message = await asyncio.wait_for(self._ws.recv(), timeout=self._config.timeout_seconds)
+            payload = self._decode_response(raw_message)
+
+            if payload.get("type") == "event":
+                self._event_buffer.append(payload)
+                continue
+
+            response_id = payload.get("id")
+            if response_id is not None and response_id != request_id:
+                raise BridgeProtocolError(
+                    f"Bridge returned mismatched id. expected={request_id} received={response_id}"
+                )
+
+            return raw_message
+
     async def _ensure_connected(self) -> None:
         if self._ws is not None:
             return
@@ -123,6 +164,11 @@ class RmgBridgeClient:
                 await self._ws.close()
             finally:
                 self._ws = None
+
+    def drain_buffered_events(self) -> list[dict[str, Any]]:
+        events = list(self._event_buffer)
+        self._event_buffer.clear()
+        return events
 
     @staticmethod
     def _decode_response(raw_response: Any) -> dict[str, Any]:
@@ -359,6 +405,121 @@ async def clear_breakpoints() -> dict[str, Any]:
     data = response.get("data")
     if not isinstance(data, dict):
         raise BridgeProtocolError("Bridge returned a non-object payload for clear_breakpoints")
+    return data
+
+
+@mcp.tool()
+async def add_watchpoint(
+    address_hex: str,
+    access: str = "read_write",
+    end_address_hex: str | None = None,
+    enabled: bool = True,
+    log: bool = False,
+) -> dict[str, Any]:
+    """Add a watchpoint for read, write or execute access using the same debugger backend as breakpoints."""
+
+    payload: dict[str, Any] = {
+        "address": _normalize_hex(address_hex),
+        "kinds": _normalize_watchpoint_access(access),
+        "enabled": enabled,
+        "log": log,
+    }
+    if end_address_hex is not None and end_address_hex.strip():
+        payload["end_address"] = _normalize_hex(end_address_hex)
+
+    response = await bridge.request("add_breakpoint", **payload)
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for add_watchpoint")
+    return data
+
+
+@mcp.tool()
+async def load_symbols(symbol_path: str, replace_existing: bool = True) -> dict[str, Any]:
+    """Load a linker map or symbol text file so addresses can be resolved to names and labels."""
+
+    response = await bridge.request(
+        "load_symbols",
+        path=symbol_path.strip(),
+        replace=replace_existing,
+    )
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for load_symbols")
+    return data
+
+
+@mcp.tool()
+async def clear_symbols() -> dict[str, Any]:
+    """Clear all currently loaded symbols and map-file metadata."""
+
+    response = await bridge.request("clear_symbols")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for clear_symbols")
+    return data
+
+
+@mcp.tool()
+async def symbol_status() -> dict[str, Any]:
+    """Report how many symbols are loaded and which source files they came from."""
+
+    response = await bridge.request("symbol_status")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for symbol_status")
+    return data
+
+
+@mcp.tool()
+async def resolve_symbol(address_hex: str) -> dict[str, Any]:
+    """Resolve a CPU address to the nearest loaded symbol, including offset within that symbol."""
+
+    response = await bridge.request("resolve_symbol", address=_normalize_hex(address_hex))
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for resolve_symbol")
+    return data
+
+
+@mcp.tool()
+async def lookup_symbol(query: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Find loaded symbols by partial name match for fast navigation through decomp labels or map entries."""
+
+    if limit <= 0:
+        raise ValueError("limit must be greater than zero")
+
+    response = await bridge.request("lookup_symbol", query=query.strip(), limit=limit)
+    data = response.get("data")
+    if not isinstance(data, list):
+        raise BridgeProtocolError("Bridge returned a non-array payload for lookup_symbol")
+    return [item for item in data if isinstance(item, dict)]
+
+
+@mcp.tool()
+async def get_debug_events(
+    since_id: int = 0,
+    limit: int = 100,
+    event_types: str = "",
+) -> dict[str, Any]:
+    """Fetch structured debugger events such as breakpoint hits, watchpoint hits, stepping and symbol loading."""
+
+    if since_id < 0:
+        raise ValueError("since_id must be zero or greater")
+    if limit <= 0:
+        raise ValueError("limit must be greater than zero")
+
+    payload: dict[str, Any] = {
+        "since_id": since_id,
+        "limit": limit,
+    }
+    if event_types.strip():
+        payload["event_types"] = event_types
+
+    response = await bridge.request("get_debug_events", **payload)
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise BridgeProtocolError("Bridge returned a non-object payload for get_debug_events")
     return data
 
 

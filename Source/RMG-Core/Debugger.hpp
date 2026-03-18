@@ -39,6 +39,52 @@ struct CoreDebuggerBreakpoint
     uint32_t flags = 0;
 };
 
+struct CoreDebuggerSymbol
+{
+    uint32_t address = 0;
+    uint32_t size = 0;
+    std::string name;
+    std::string source;
+};
+
+struct CoreDebuggerResolvedSymbol
+{
+    bool found = false;
+    bool exact = false;
+    uint32_t queryAddress = 0;
+    uint32_t symbolAddress = 0;
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    std::string name;
+    std::string source;
+};
+
+struct CoreDebuggerSymbolStats
+{
+    uint32_t symbolCount = 0;
+    uint32_t sourceCount = 0;
+    std::vector<std::string> sources;
+};
+
+struct CoreDebuggerEvent
+{
+    uint64_t id = 0;
+    uint64_t timestampMs = 0;
+    std::string type;
+    std::string message;
+    int runState = 0;
+    uint32_t pc = 0;
+    uint32_t address = 0;
+    uint32_t endAddress = 0;
+    uint32_t flags = 0;
+};
+
+struct CoreDebuggerEventStats
+{
+    uint64_t latestId = 0;
+    uint32_t queuedCount = 0;
+};
+
 void CoreDebuggerResetSession(void);
 bool CoreDebuggerConfigureCallbacks(void);
 bool CoreDebuggerSupported(void);
@@ -57,5 +103,15 @@ bool CoreDebuggerAddBreakpoint(uint32_t address, uint32_t endAddress, uint32_t f
 bool CoreDebuggerRemoveBreakpoint(uint32_t address);
 bool CoreDebuggerListBreakpoints(std::vector<CoreDebuggerBreakpoint>& breakpoints);
 bool CoreDebuggerClearBreakpoints(void);
+bool CoreDebuggerLoadSymbolFile(const std::string& path, bool replaceExisting, uint32_t& loadedCount, uint32_t& skippedCount);
+void CoreDebuggerClearSymbols(void);
+bool CoreDebuggerGetSymbolStats(CoreDebuggerSymbolStats& stats);
+bool CoreDebuggerResolveSymbol(uint32_t address, CoreDebuggerResolvedSymbol& symbol);
+bool CoreDebuggerLookupSymbols(const std::string& query, uint32_t limit, std::vector<CoreDebuggerSymbol>& symbols);
+bool CoreDebuggerGetEventStats(CoreDebuggerEventStats& stats);
+bool CoreDebuggerGetEvents(uint64_t sinceId,
+                           uint32_t limit,
+                           std::vector<CoreDebuggerEvent>& events,
+                           uint64_t& latestId);
 
 #endif // CORE_DEBUGGER_HPP

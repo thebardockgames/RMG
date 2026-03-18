@@ -11,15 +11,20 @@
 #define MCP_MCPBRIDGESERVER_HPP
 
 #include <QByteArray>
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QList>
 #include <QObject>
+#include <QSet>
 #include <QString>
+
+#include <RMG-Core/Debugger.hpp>
 
 QT_FORWARD_DECLARE_CLASS(QWebSocket)
 QT_FORWARD_DECLARE_CLASS(QWebSocketServer)
+QT_FORWARD_DECLARE_CLASS(QTimer)
 
 namespace MCP
 {
@@ -44,9 +49,17 @@ class McpBridgeServer : public QObject
     void onNewConnection(void);
     void onTextMessageReceived(QString message);
     void onSocketDisconnected(void);
+    void onEventPump(void);
 
   private:
+    struct EventStreamSubscription
+    {
+        bool includeVi = false;
+        QStringList filters;
+    };
+
     void sendJson(QWebSocket* socket, const QJsonObject& payload) const;
+    void broadcastEvent(const CoreDebuggerEvent& event) const;
     QJsonObject processRequest(const QJsonObject& request) const;
     QJsonObject handleReadRam(const QJsonObject& request) const;
     QJsonObject handleWriteRam(const QJsonObject& request) const;
@@ -63,6 +76,13 @@ class McpBridgeServer : public QObject
     QJsonObject handleRemoveBreakpoint(const QJsonObject& request) const;
     QJsonObject handleListBreakpoints(const QJsonObject& request) const;
     QJsonObject handleClearBreakpoints(const QJsonObject& request) const;
+    QJsonObject handleLoadSymbols(const QJsonObject& request) const;
+    QJsonObject handleClearSymbols(const QJsonObject& request) const;
+    QJsonObject handleSymbolStatus(const QJsonObject& request) const;
+    QJsonObject handleResolveSymbol(const QJsonObject& request) const;
+    QJsonObject handleLookupSymbol(const QJsonObject& request) const;
+    QJsonObject handleGetDebugEvents(const QJsonObject& request) const;
+    QJsonObject handleConfigureEventStream(const QJsonObject& request);
 
     static bool tryParseHexU32(QString text, quint32* value);
     static bool tryParseHexU64(QString text, quint64* value);
@@ -75,13 +95,19 @@ class McpBridgeServer : public QObject
     static QString breakpointFlagsToString(quint32 flags);
     static QJsonArray breakpointKindsToJson(quint32 flags);
     static QJsonArray instructionListToJson(const QJsonArray& instructions);
+    static QJsonObject symbolToJson(const CoreDebuggerSymbol& symbol);
+    static QJsonObject resolvedSymbolToJson(const CoreDebuggerResolvedSymbol& symbol);
+    static QJsonObject eventToJson(const CoreDebuggerEvent& event);
     static QJsonObject makeOkResponse(const QJsonObject& request, const QJsonValue& data);
     static QJsonObject makeErrorResponse(const QJsonObject& request, const QString& message);
     static void copyRequestId(const QJsonObject& request, QJsonObject* response);
 
     quint16 port;
     QWebSocketServer* server = nullptr;
+    QTimer* eventTimer = nullptr;
     QList<QWebSocket*> clients;
+    QHash<QWebSocket*, EventStreamSubscription> eventSubscribers;
+    quint64 lastBroadcastEventId = 0;
 };
 } // namespace MCP
 

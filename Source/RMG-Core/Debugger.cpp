@@ -21,31 +21,357 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <optional>
+#include <set>
+#include <sstream>
 
 namespace
 {
 constexpr uint32_t kMaxRdramSize = UINT32_C(0x00800000);
 constexpr uint32_t kMinInstructionSize = UINT32_C(4);
+constexpr uint32_t kMaxEventBatchSize = UINT32_C(1024);
+constexpr size_t kMaxQueuedEvents = 4096;
+constexpr uint64_t kViEventThrottleMs = 250;
 
 std::mutex g_breakpointMutex;
 std::vector<CoreDebuggerBreakpoint> g_managedBreakpoints;
+std::mutex g_symbolMutex;
+std::vector<CoreDebuggerSymbol> g_symbols;
+std::set<std::string> g_symbolSources;
+std::mutex g_eventMutex;
+std::deque<CoreDebuggerEvent> g_events;
+uint64_t g_nextEventId = 1;
+uint32_t g_lastCallbackPc = 0;
+int g_lastObservedRunState = -1;
+uint32_t g_lastTriggeredAddress = 0;
+uint32_t g_lastTriggeredFlags = 0;
+uint32_t g_lastTriggeredPc = 0;
+uint64_t g_lastViEventTimestampMs = 0;
+bool g_breakpointEventsArmed = false;
 bool g_debuggerCallbacksConfigured = false;
+
+std::string trim_copy(const std::string& text)
+{
+    size_t begin = 0;
+    while (begin < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[begin])))
+    {
+        begin++;
+    }
+
+    size_t end = text.size();
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(text[end - 1])))
+    {
+        end--;
+    }
+
+    return text.substr(begin, end - begin);
+}
+
+std::vector<std::string> split_whitespace(const std::string& text)
+{
+    std::istringstream stream(text);
+    std::vector<std::string> tokens;
+    std::string token;
+    while (stream >> token)
+    {
+        tokens.push_back(token);
+    }
+
+    return tokens;
+}
+
+bool looks_like_hex_token(const std::string& token)
+{
+    if (token.empty())
+    {
+        return false;
+    }
+
+    size_t offset = 0;
+    if (token.size() > 2 &&
+        token[0] == '0' &&
+        (token[1] == 'x' || token[1] == 'X'))
+    {
+        offset = 2;
+    }
+
+    if ((token.size() - offset) < 6)
+    {
+        return false;
+    }
+
+    for (size_t index = offset; index < token.size(); index++)
+    {
+        if (!std::isxdigit(static_cast<unsigned char>(token[index])))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool try_parse_hex_address_token(const std::string& token, uint32_t* value)
+{
+    if (value == nullptr ||
+        !looks_like_hex_token(token))
+    {
+        return false;
+    }
+
+    std::string normalized = token;
+    if (normalized.size() > 2 &&
+        normalized[0] == '0' &&
+        (normalized[1] == 'x' || normalized[1] == 'X'))
+    {
+        normalized = normalized.substr(2);
+    }
+
+    try
+    {
+        unsigned long long parsedValue = std::stoull(normalized, nullptr, 16);
+        *value = static_cast<uint32_t>(parsedValue & UINT32_C(0xffffffff));
+        return true;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+bool parse_symbol_assignment(const std::vector<std::string>& tokens, CoreDebuggerSymbol* symbol)
+{
+    if (symbol == nullptr ||
+        tokens.size() < 3 ||
+        tokens[1] != "=")
+    {
+        return false;
+    }
+
+    uint32_t address = 0;
+    if (!try_parse_hex_address_token(tokens[2], &address))
+    {
+        return false;
+    }
+
+    symbol->address = address;
+    symbol->name = tokens[0];
+    return true;
+}
+
+bool parse_symbol_row(const std::vector<std::string>& tokens, CoreDebuggerSymbol* symbol)
+{
+    if (symbol == nullptr ||
+        tokens.size() < 2)
+    {
+        return false;
+    }
+
+    uint32_t address = 0;
+    if (!try_parse_hex_address_token(tokens[0], &address))
+    {
+        return false;
+    }
+
+    std::string name;
+    if (tokens.size() >= 3 &&
+        tokens[1].size() == 1 &&
+        std::isalpha(static_cast<unsigned char>(tokens[1][0])))
+    {
+        name = tokens[2];
+    }
+    else
+    {
+        name = tokens.back();
+    }
+
+    if (name.empty() ||
+        looks_like_hex_token(name))
+    {
+        return false;
+    }
+
+    symbol->address = address;
+    symbol->name = name;
+    return true;
+}
+
+bool parse_symbol_line(const std::string& line, const std::string& source, CoreDebuggerSymbol* symbol)
+{
+    if (symbol == nullptr)
+    {
+        return false;
+    }
+
+    std::string sanitized = line;
+    for (const std::string& marker : {std::string("//"), std::string("#"), std::string(";")})
+    {
+        size_t markerIndex = sanitized.find(marker);
+        if (markerIndex != std::string::npos)
+        {
+            sanitized = sanitized.substr(0, markerIndex);
+        }
+    }
+
+    sanitized = trim_copy(sanitized);
+    if (sanitized.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::string> tokens = split_whitespace(sanitized);
+    if (tokens.empty())
+    {
+        return false;
+    }
+
+    CoreDebuggerSymbol parsedSymbol;
+    bool parsed = parse_symbol_assignment(tokens, &parsedSymbol) ||
+                  parse_symbol_row(tokens, &parsedSymbol);
+    if (!parsed)
+    {
+        return false;
+    }
+
+    parsedSymbol.source = source;
+    *symbol = std::move(parsedSymbol);
+    return true;
+}
+
+void push_debugger_event(const std::string& type,
+                         const std::string& message,
+                         int runState,
+                         uint32_t pc,
+                         uint32_t address,
+                         uint32_t endAddress,
+                         uint32_t flags)
+{
+    std::scoped_lock lock(g_eventMutex);
+
+    CoreDebuggerEvent event;
+    event.id = g_nextEventId++;
+    event.timestampMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  std::chrono::system_clock::now().time_since_epoch())
+                                                  .count());
+    event.type = type;
+    event.message = message;
+    event.runState = runState;
+    event.pc = pc;
+    event.address = address;
+    event.endAddress = endAddress;
+    event.flags = flags;
+
+    g_events.push_back(std::move(event));
+    while (g_events.size() > kMaxQueuedEvents)
+    {
+        g_events.pop_front();
+    }
+}
 
 void debugger_ui_init_callback(void)
 {
+    g_lastObservedRunState = -1;
+    g_lastCallbackPc = 0;
+    g_lastTriggeredAddress = 0;
+    g_lastTriggeredFlags = 0;
+    g_lastTriggeredPc = 0;
+    g_lastViEventTimestampMs = 0;
+    g_breakpointEventsArmed = false;
+    push_debugger_event("debugger.init", "Debugger frontend callbacks initialized", 0, 0, 0, 0, 0);
 }
 
 void debugger_ui_update_callback(unsigned int pc)
 {
-    (void)pc;
+    if (!m64p::Debugger.IsHooked() ||
+        m64p::Debugger.DebugGetState == nullptr)
+    {
+        return;
+    }
+
+    int runState = m64p::Debugger.DebugGetState(M64P_DBG_RUN_STATE);
+    if (runState != g_lastObservedRunState ||
+        static_cast<uint32_t>(pc) != g_lastCallbackPc)
+    {
+        push_debugger_event("debugger.update",
+                            "Debugger UI update callback",
+                            runState,
+                            static_cast<uint32_t>(pc),
+                            0,
+                            0,
+                            0);
+        g_lastObservedRunState = runState;
+        g_lastCallbackPc = static_cast<uint32_t>(pc);
+    }
+
+    if (m64p::Debugger.DebugBreakpointTriggeredBy != nullptr)
+    {
+        uint32_t breakpointFlags = 0;
+        uint32_t breakpointAddress = 0;
+        m64p::Debugger.DebugBreakpointTriggeredBy(&breakpointFlags, &breakpointAddress);
+
+        if (g_breakpointEventsArmed &&
+            runState == M64P_DBG_RUNSTATE_PAUSED &&
+            (breakpointFlags != 0 || breakpointAddress != 0) &&
+            (breakpointFlags != g_lastTriggeredFlags ||
+             breakpointAddress != g_lastTriggeredAddress ||
+             static_cast<uint32_t>(pc) != g_lastTriggeredPc))
+        {
+            std::string eventType = (breakpointFlags & (M64P_BKP_FLAG_READ | M64P_BKP_FLAG_WRITE)) != 0
+                                        ? "debugger.watchpoint_hit"
+                                        : "debugger.breakpoint_hit";
+
+            push_debugger_event(eventType,
+                                "Debugger breakpoint/watchpoint triggered",
+                                runState,
+                                static_cast<uint32_t>(pc),
+                                breakpointAddress,
+                                breakpointAddress,
+                                breakpointFlags);
+
+            g_lastTriggeredFlags = breakpointFlags;
+            g_lastTriggeredAddress = breakpointAddress;
+            g_lastTriggeredPc = static_cast<uint32_t>(pc);
+            g_breakpointEventsArmed = false;
+        }
+        else if (!g_breakpointEventsArmed)
+        {
+            g_lastTriggeredFlags = 0;
+            g_lastTriggeredAddress = 0;
+            g_lastTriggeredPc = 0;
+        }
+    }
 }
 
 void debugger_ui_vi_callback(void)
 {
+    int runState = 0;
+    if (m64p::Debugger.IsHooked() &&
+        m64p::Debugger.DebugGetState != nullptr)
+    {
+        runState = m64p::Debugger.DebugGetState(M64P_DBG_RUN_STATE);
+    }
+
+    const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                     std::chrono::system_clock::now().time_since_epoch())
+                                                     .count());
+
+    if ((nowMs - g_lastViEventTimestampMs) < kViEventThrottleMs)
+    {
+        return;
+    }
+
+    g_lastViEventTimestampMs = nowMs;
+    push_debugger_event("debugger.vi", "Video interrupt callback", runState, g_lastCallbackPc, 0, 0, 0);
 }
 
 void set_error_from_m64p(const std::string& prefix, m64p_error ret)
@@ -429,6 +755,36 @@ uint32_t normalize_memory_address(uint32_t address)
     return address;
 }
 
+uint32_t get_rdram_size(void);
+
+std::optional<uint32_t> normalize_runtime_symbol_address(uint32_t address, bool allowPhysical)
+{
+    if ((address & UINT32_C(0xe0000000)) == UINT32_C(0x80000000) ||
+        (address & UINT32_C(0xe0000000)) == UINT32_C(0xa0000000))
+    {
+        uint32_t normalized = normalize_memory_address(address);
+        if (normalized >= get_rdram_size())
+        {
+            return std::nullopt;
+        }
+
+        return UINT32_C(0x80000000) | normalized;
+    }
+
+    if (!allowPhysical)
+    {
+        return std::nullopt;
+    }
+
+    uint32_t normalized = address;
+    if (normalized >= get_rdram_size())
+    {
+        return std::nullopt;
+    }
+
+    return UINT32_C(0x80000000) | normalized;
+}
+
 uint32_t get_rdram_size(void)
 {
     return CoreSettingsGetBoolValue(SettingsID::Core_DisableExtraMem)
@@ -517,6 +873,65 @@ std::vector<CoreDebuggerBreakpoint>::iterator find_managed_breakpoint(uint32_t a
         return breakpoint.address == address;
     });
 }
+
+void sort_and_deduplicate_symbols(void)
+{
+    std::sort(g_symbols.begin(), g_symbols.end(), [](const CoreDebuggerSymbol& lhs, const CoreDebuggerSymbol& rhs) {
+        if (lhs.address != rhs.address)
+        {
+            return lhs.address < rhs.address;
+        }
+
+        if (lhs.name != rhs.name)
+        {
+            return lhs.name < rhs.name;
+        }
+
+        return lhs.source < rhs.source;
+    });
+
+    g_symbols.erase(std::unique(g_symbols.begin(),
+                                g_symbols.end(),
+                                [](const CoreDebuggerSymbol& lhs, const CoreDebuggerSymbol& rhs) {
+                                    return lhs.address == rhs.address &&
+                                           lhs.name == rhs.name &&
+                                           lhs.source == rhs.source;
+                                }),
+                    g_symbols.end());
+}
+
+std::vector<CoreDebuggerSymbol>::const_iterator find_symbol_by_address(uint32_t address)
+{
+    auto iterator = std::upper_bound(g_symbols.begin(),
+                                     g_symbols.end(),
+                                     address,
+                                     [](uint32_t value, const CoreDebuggerSymbol& symbol) {
+                                         return value < symbol.address;
+                                     });
+
+    if (iterator == g_symbols.begin())
+    {
+        return g_symbols.end();
+    }
+
+    --iterator;
+    return iterator;
+}
+
+bool normalize_symbol_limit(uint32_t* limit)
+{
+    if (limit == nullptr)
+    {
+        return false;
+    }
+
+    if (*limit == 0 || *limit > kMaxEventBatchSize)
+    {
+        *limit = std::min<uint32_t>(std::max<uint32_t>(*limit, 1U), kMaxEventBatchSize);
+    }
+
+    return true;
+}
 } // namespace
 
 CORE_EXPORT bool CoreDebuggerConfigureCallbacks(void)
@@ -543,8 +958,22 @@ CORE_EXPORT bool CoreDebuggerConfigureCallbacks(void)
 
 CORE_EXPORT void CoreDebuggerResetSession(void)
 {
-    std::scoped_lock lock(g_breakpointMutex);
-    g_managedBreakpoints.clear();
+    {
+        std::scoped_lock lock(g_breakpointMutex);
+        g_managedBreakpoints.clear();
+    }
+
+    {
+        std::scoped_lock lock(g_eventMutex);
+        g_events.clear();
+        g_nextEventId = 1;
+    }
+
+    g_lastCallbackPc = 0;
+    g_lastObservedRunState = -1;
+    g_lastTriggeredAddress = 0;
+    g_lastTriggeredFlags = 0;
+    g_lastTriggeredPc = 0;
 }
 
 CORE_EXPORT bool CoreDebuggerSupported(void)
@@ -779,6 +1208,11 @@ CORE_EXPORT bool CoreDebuggerPauseExecution(void)
         return false;
     }
 
+    g_lastTriggeredFlags = 0;
+    g_lastTriggeredAddress = 0;
+    g_lastTriggeredPc = 0;
+    g_breakpointEventsArmed = false;
+    push_debugger_event("execution.pause_requested", "Pause requested through MCP bridge", M64P_DBG_RUNSTATE_PAUSED, 0, 0, 0, 0);
     return true;
 }
 
@@ -803,6 +1237,11 @@ CORE_EXPORT bool CoreDebuggerResumeExecution(void)
         return false;
     }
 
+    g_lastTriggeredFlags = 0;
+    g_lastTriggeredAddress = 0;
+    g_lastTriggeredPc = 0;
+    g_breakpointEventsArmed = true;
+    push_debugger_event("execution.resume_requested", "Resume requested through MCP bridge", M64P_DBG_RUNSTATE_RUNNING, 0, 0, 0, 0);
     return true;
 }
 
@@ -836,6 +1275,17 @@ CORE_EXPORT bool CoreDebuggerStepInstructions(uint32_t count, uint32_t& currentP
     }
 
     currentPc = static_cast<uint32_t>(pc);
+    g_lastTriggeredFlags = 0;
+    g_lastTriggeredAddress = 0;
+    g_lastTriggeredPc = 0;
+    g_breakpointEventsArmed = false;
+    push_debugger_event("execution.step",
+                        "Instruction step requested through MCP bridge",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        currentPc,
+                        0,
+                        0,
+                        0);
     return true;
 }
 
@@ -869,6 +1319,13 @@ CORE_EXPORT bool CoreDebuggerAddBreakpoint(uint32_t address, uint32_t endAddress
         g_managedBreakpoints.push_back({address, endAddress, flags});
     }
 
+    push_debugger_event("debugger.breakpoint_added",
+                        "Breakpoint/watchpoint added",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        0,
+                        address,
+                        endAddress,
+                        flags);
     return true;
 }
 
@@ -910,6 +1367,13 @@ CORE_EXPORT bool CoreDebuggerRemoveBreakpoint(uint32_t address)
         }
     }
 
+    push_debugger_event("debugger.breakpoint_removed",
+                        "Breakpoint/watchpoint removed",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        0,
+                        address,
+                        address,
+                        0);
     return true;
 }
 
@@ -953,6 +1417,209 @@ CORE_EXPORT bool CoreDebuggerClearBreakpoints(void)
     {
         std::scoped_lock lock(g_breakpointMutex);
         g_managedBreakpoints.clear();
+    }
+
+    push_debugger_event("debugger.breakpoints_cleared",
+                        "All breakpoints/watchpoints cleared",
+                        M64P_DBG_RUNSTATE_PAUSED,
+                        0,
+                        0,
+                        0,
+                        0);
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerLoadSymbolFile(const std::string& path,
+                                            bool replaceExisting,
+                                            uint32_t& loadedCount,
+                                            uint32_t& skippedCount)
+{
+    std::ifstream input(path);
+    if (!input.is_open())
+    {
+        CoreSetError("CoreDebuggerLoadSymbolFile Failed: could not open \"" + path + "\"");
+        return false;
+    }
+
+    std::vector<CoreDebuggerSymbol> parsedSymbols;
+    std::string line;
+    loadedCount = 0;
+    skippedCount = 0;
+
+    const std::string normalizedPath = std::filesystem::path(path).lexically_normal().string();
+
+    while (std::getline(input, line))
+    {
+        CoreDebuggerSymbol symbol;
+        if (!parse_symbol_line(line, normalizedPath, &symbol))
+        {
+            skippedCount++;
+            continue;
+        }
+
+        parsedSymbols.push_back(std::move(symbol));
+        loadedCount++;
+    }
+
+    {
+        std::scoped_lock lock(g_symbolMutex);
+        if (replaceExisting)
+        {
+            g_symbols.clear();
+            g_symbolSources.clear();
+        }
+
+        g_symbols.insert(g_symbols.end(), parsedSymbols.begin(), parsedSymbols.end());
+        if (!parsedSymbols.empty())
+        {
+            g_symbolSources.insert(normalizedPath);
+        }
+
+        sort_and_deduplicate_symbols();
+    }
+
+    push_debugger_event("symbols.loaded",
+                        "Symbol file loaded",
+                        0,
+                        0,
+                        0,
+                        0,
+                        0);
+    return true;
+}
+
+CORE_EXPORT void CoreDebuggerClearSymbols(void)
+{
+    {
+        std::scoped_lock lock(g_symbolMutex);
+        g_symbols.clear();
+        g_symbolSources.clear();
+    }
+
+    push_debugger_event("symbols.cleared", "All loaded symbols were cleared", 0, 0, 0, 0, 0);
+}
+
+CORE_EXPORT bool CoreDebuggerGetSymbolStats(CoreDebuggerSymbolStats& stats)
+{
+    std::scoped_lock lock(g_symbolMutex);
+    stats.symbolCount = static_cast<uint32_t>(g_symbols.size());
+    stats.sourceCount = static_cast<uint32_t>(g_symbolSources.size());
+    stats.sources.assign(g_symbolSources.begin(), g_symbolSources.end());
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerResolveSymbol(uint32_t address, CoreDebuggerResolvedSymbol& symbol)
+{
+    std::scoped_lock lock(g_symbolMutex);
+
+    symbol = {};
+    symbol.queryAddress = address;
+    if (g_symbols.empty())
+    {
+        return true;
+    }
+
+    std::optional<uint32_t> normalizedQuery = normalize_runtime_symbol_address(address, true);
+    if (!normalizedQuery.has_value())
+    {
+        return true;
+    }
+
+    auto iterator = find_symbol_by_address(*normalizedQuery);
+    if (iterator == g_symbols.end() && !g_symbols.empty())
+    {
+        iterator = std::prev(g_symbols.end());
+    }
+
+    while (iterator != g_symbols.end())
+    {
+        std::optional<uint32_t> normalizedSymbol = normalize_runtime_symbol_address(iterator->address, false);
+        if (normalizedSymbol.has_value() &&
+            *normalizedSymbol <= *normalizedQuery)
+        {
+            symbol.found = true;
+            symbol.exact = *normalizedSymbol == *normalizedQuery;
+            symbol.symbolAddress = iterator->address;
+            symbol.offset = *normalizedQuery - *normalizedSymbol;
+            symbol.size = iterator->size;
+            symbol.name = iterator->name;
+            symbol.source = iterator->source;
+            return true;
+        }
+
+        if (iterator == g_symbols.begin())
+        {
+            break;
+        }
+
+        --iterator;
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerLookupSymbols(const std::string& query, uint32_t limit, std::vector<CoreDebuggerSymbol>& symbols)
+{
+    symbols.clear();
+
+    std::string normalizedQuery = normalize_register_name(query);
+    if (normalizedQuery.empty())
+    {
+        return true;
+    }
+
+    normalize_symbol_limit(&limit);
+
+    std::scoped_lock lock(g_symbolMutex);
+    for (const CoreDebuggerSymbol& symbol : g_symbols)
+    {
+        std::string normalizedName = normalize_register_name(symbol.name);
+        if (normalizedName.find(normalizedQuery) == std::string::npos)
+        {
+            continue;
+        }
+
+        symbols.push_back(symbol);
+        if (symbols.size() >= limit)
+        {
+            break;
+        }
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerGetEventStats(CoreDebuggerEventStats& stats)
+{
+    std::scoped_lock lock(g_eventMutex);
+    stats.latestId = g_events.empty() ? 0 : g_events.back().id;
+    stats.queuedCount = static_cast<uint32_t>(g_events.size());
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerGetEvents(uint64_t sinceId,
+                                       uint32_t limit,
+                                       std::vector<CoreDebuggerEvent>& events,
+                                       uint64_t& latestId)
+{
+    events.clear();
+    normalize_symbol_limit(&limit);
+
+    std::scoped_lock lock(g_eventMutex);
+    latestId = g_events.empty() ? 0 : g_events.back().id;
+
+    for (const CoreDebuggerEvent& event : g_events)
+    {
+        if (event.id <= sinceId)
+        {
+            continue;
+        }
+
+        events.push_back(event);
+        if (events.size() >= limit)
+        {
+            break;
+        }
     }
 
     return true;

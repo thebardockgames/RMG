@@ -13,6 +13,7 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QStringList>
+#include <QTimer>
 #include <QWebSocket>
 #include <QWebSocketServer>
 
@@ -29,6 +30,8 @@ namespace
 constexpr quint32 kMaxReadSize = 4096;
 constexpr quint32 kMaxDisassemblyInstructions = 256;
 constexpr quint32 kMaxStepCount = 1024;
+constexpr quint32 kMaxSymbolLookupResults = 128;
+constexpr quint32 kMaxEventResults = 512;
 
 QString requestRegisterName(const QJsonObject& request)
 {
@@ -40,6 +43,71 @@ QString requestRegisterName(const QJsonObject& request)
 
     return registerName.trimmed();
 }
+
+QStringList requestEventTypeFilter(const QJsonObject& request)
+{
+    QStringList filters;
+
+    const auto appendValues = [&filters](const QJsonValue& value) {
+        if (!value.isArray())
+        {
+            return;
+        }
+
+        for (const QJsonValue& item : value.toArray())
+        {
+            QString type = item.toString().trimmed();
+            if (!type.isEmpty())
+            {
+                filters.append(type);
+            }
+        }
+    };
+
+    appendValues(request.value(QStringLiteral("types")));
+    appendValues(request.value(QStringLiteral("event_types")));
+
+    if (!filters.isEmpty())
+    {
+        filters.removeDuplicates();
+        return filters;
+    }
+
+    for (const QString& key : {QStringLiteral("event_types"), QStringLiteral("types")})
+    {
+        QString text = request.value(key).toString();
+        for (QString part : text.split(',', Qt::SkipEmptyParts))
+        {
+            part = part.trimmed();
+            if (!part.isEmpty())
+            {
+                filters.append(part);
+            }
+        }
+    }
+
+    filters.removeDuplicates();
+    return filters;
+}
+
+bool eventMatchesFilters(const CoreDebuggerEvent& event, const QStringList& filters)
+{
+    if (filters.isEmpty())
+    {
+        return true;
+    }
+
+    const QString eventType = QString::fromStdString(event.type);
+    for (const QString& filter : filters)
+    {
+        if (eventType.contains(filter, Qt::CaseInsensitive))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
 } // namespace
 
 using namespace MCP;
@@ -48,6 +116,10 @@ McpBridgeServer::McpBridgeServer(quint16 port, QObject* parent) : QObject(parent
 {
     this->server = new QWebSocketServer(QStringLiteral("MCP Bridge"), QWebSocketServer::NonSecureMode, this);
     connect(this->server, &QWebSocketServer::newConnection, this, &McpBridgeServer::onNewConnection);
+
+    this->eventTimer = new QTimer(this);
+    this->eventTimer->setInterval(50);
+    connect(this->eventTimer, &QTimer::timeout, this, &McpBridgeServer::onEventPump);
 }
 
 McpBridgeServer::~McpBridgeServer()
@@ -69,6 +141,10 @@ bool McpBridgeServer::Start(void)
                                    .arg(this->port)
                                    .arg(this->server->errorString()));
     }
+    else if (this->eventTimer != nullptr)
+    {
+        this->eventTimer->start();
+    }
 
     return ret;
 }
@@ -87,11 +163,18 @@ void McpBridgeServer::Stop(void)
     }
 
     this->clients.clear();
+    this->eventSubscribers.clear();
+    this->lastBroadcastEventId = 0;
 
     if (this->server != nullptr &&
         this->server->isListening())
     {
         this->server->close();
+    }
+
+    if (this->eventTimer != nullptr)
+    {
+        this->eventTimer->stop();
     }
 }
 
@@ -155,6 +238,7 @@ void McpBridgeServer::onSocketDisconnected(void)
     }
 
     this->clients.removeAll(socket);
+    this->eventSubscribers.remove(socket);
     socket->deleteLater();
 }
 
@@ -166,6 +250,67 @@ void McpBridgeServer::sendJson(QWebSocket* socket, const QJsonObject& payload) c
     }
 
     socket->sendTextMessage(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact)));
+}
+
+void McpBridgeServer::broadcastEvent(const CoreDebuggerEvent& event) const
+{
+    const QString eventType = QString::fromStdString(event.type);
+    const QJsonObject payload{
+        {QStringLiteral("type"), QStringLiteral("event")},
+        {QStringLiteral("name"), eventType},
+        {QStringLiteral("data"), eventToJson(event)},
+    };
+
+    for (auto iterator = this->eventSubscribers.cbegin(); iterator != this->eventSubscribers.cend(); ++iterator)
+    {
+        QWebSocket* socket = iterator.key();
+        const EventStreamSubscription& subscription = iterator.value();
+        if (socket == nullptr)
+        {
+            continue;
+        }
+
+        if (!subscription.includeVi && eventType == QStringLiteral("debugger.vi"))
+        {
+            continue;
+        }
+
+        if (!eventMatchesFilters(event, subscription.filters))
+        {
+            continue;
+        }
+
+        this->sendJson(socket, payload);
+    }
+}
+
+void McpBridgeServer::onEventPump(void)
+{
+    if (this->eventSubscribers.isEmpty())
+    {
+        return;
+    }
+
+    std::vector<CoreDebuggerEvent> events;
+    uint64_t latestId = this->lastBroadcastEventId;
+    if (!CoreDebuggerGetEvents(this->lastBroadcastEventId,
+                               kMaxEventResults,
+                               events,
+                               latestId))
+    {
+        return;
+    }
+
+    for (const CoreDebuggerEvent& event : events)
+    {
+        this->broadcastEvent(event);
+        this->lastBroadcastEventId = std::max<quint64>(this->lastBroadcastEventId, event.id);
+    }
+
+    if (events.empty())
+    {
+        this->lastBroadcastEventId = latestId;
+    }
 }
 
 QJsonObject McpBridgeServer::processRequest(const QJsonObject& request) const
@@ -254,6 +399,41 @@ QJsonObject McpBridgeServer::processRequest(const QJsonObject& request) const
     if (action == QStringLiteral("clear_breakpoints"))
     {
         return this->handleClearBreakpoints(request);
+    }
+
+    if (action == QStringLiteral("load_symbols"))
+    {
+        return this->handleLoadSymbols(request);
+    }
+
+    if (action == QStringLiteral("clear_symbols"))
+    {
+        return this->handleClearSymbols(request);
+    }
+
+    if (action == QStringLiteral("symbol_status"))
+    {
+        return this->handleSymbolStatus(request);
+    }
+
+    if (action == QStringLiteral("resolve_symbol"))
+    {
+        return this->handleResolveSymbol(request);
+    }
+
+    if (action == QStringLiteral("lookup_symbol"))
+    {
+        return this->handleLookupSymbol(request);
+    }
+
+    if (action == QStringLiteral("get_debug_events"))
+    {
+        return this->handleGetDebugEvents(request);
+    }
+
+    if (action == QStringLiteral("configure_event_stream"))
+    {
+        return const_cast<McpBridgeServer*>(this)->handleConfigureEventStream(request);
     }
 
     return makeErrorResponse(request, QStringLiteral("Unsupported action: %1").arg(action));
@@ -375,10 +555,14 @@ QJsonObject McpBridgeServer::handleDebuggerState(const QJsonObject& request) con
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
 
+    CoreDebuggerResolvedSymbol previousPcSymbol;
+    CoreDebuggerResolveSymbol(state.previousPc, previousPcSymbol);
+
     QJsonObject payload{
         {QStringLiteral("run_state"), runStateToString(state.runState)},
         {QStringLiteral("run_state_raw"), state.runState},
         {QStringLiteral("previous_pc"), u32ToHexString(state.previousPc)},
+        {QStringLiteral("previous_pc_symbol"), resolvedSymbolToJson(previousPcSymbol)},
         {QStringLiteral("breakpoint_count"), state.breakpointCount},
         {QStringLiteral("dynacore"), dynacoreToString(state.dynacore)},
         {QStringLiteral("dynacore_raw"), state.dynacore},
@@ -443,8 +627,12 @@ QJsonObject McpBridgeServer::handleCpuSnapshot(const QJsonObject& request) const
         return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
     }
 
+    CoreDebuggerResolvedSymbol pcSymbol;
+    CoreDebuggerResolveSymbol(static_cast<uint32_t>(pc), pcSymbol);
+
     QJsonObject payload{
         {QStringLiteral("pc"), u64ToHexString(pc)},
+        {QStringLiteral("pc_symbol"), resolvedSymbolToJson(pcSymbol)},
         {QStringLiteral("hi"), u64ToHexString(hi)},
         {QStringLiteral("lo"), u64ToHexString(lo)},
         {QStringLiteral("gpr"), gprObject},
@@ -517,6 +705,8 @@ QJsonObject McpBridgeServer::handleDisassemble(const QJsonObject& request) const
     {
         const QString mnemonic = QString::fromStdString(instruction.mnemonic).trimmed();
         const QString arguments = QString::fromStdString(instruction.arguments).trimmed();
+        CoreDebuggerResolvedSymbol symbol;
+        CoreDebuggerResolveSymbol(instruction.address, symbol);
         payload.append(QJsonObject{
             {QStringLiteral("address"), u32ToHexString(instruction.address)},
             {QStringLiteral("physical_address"), u32ToHexString(instruction.physicalAddress)},
@@ -525,6 +715,7 @@ QJsonObject McpBridgeServer::handleDisassemble(const QJsonObject& request) const
             {QStringLiteral("arguments"), arguments},
             {QStringLiteral("text"),
              arguments.isEmpty() ? mnemonic : QStringLiteral("%1 %2").arg(mnemonic, arguments)},
+            {QStringLiteral("symbol"), resolvedSymbolToJson(symbol)},
         });
     }
 
@@ -701,6 +892,8 @@ QJsonObject McpBridgeServer::handleListBreakpoints(const QJsonObject& request) c
     QJsonArray payload;
     for (const CoreDebuggerBreakpoint& breakpoint : breakpoints)
     {
+        CoreDebuggerResolvedSymbol symbol;
+        CoreDebuggerResolveSymbol(breakpoint.address, symbol);
         payload.append(QJsonObject{
             {QStringLiteral("address"), u32ToHexString(breakpoint.address)},
             {QStringLiteral("end_address"), u32ToHexString(breakpoint.endAddress)},
@@ -708,6 +901,7 @@ QJsonObject McpBridgeServer::handleListBreakpoints(const QJsonObject& request) c
             {QStringLiteral("kinds"), breakpointKindsToJson(breakpoint.flags)},
             {QStringLiteral("enabled"), (breakpoint.flags & M64P_BKP_FLAG_ENABLED) != 0},
             {QStringLiteral("log"), (breakpoint.flags & M64P_BKP_FLAG_LOG) != 0},
+            {QStringLiteral("symbol"), resolvedSymbolToJson(symbol)},
         });
     }
 
@@ -727,6 +921,211 @@ QJsonObject McpBridgeServer::handleClearBreakpoints(const QJsonObject& request) 
     }
 
     return makeOkResponse(request, QJsonObject{{QStringLiteral("cleared"), true}});
+}
+
+QJsonObject McpBridgeServer::handleLoadSymbols(const QJsonObject& request) const
+{
+    QString path = request.value(QStringLiteral("path")).toString().trimmed();
+    if (path.isEmpty())
+    {
+        path = request.value(QStringLiteral("symbol_path")).toString().trimmed();
+    }
+
+    if (path.isEmpty())
+    {
+        return makeErrorResponse(request, QStringLiteral("Missing required field: path"));
+    }
+
+    const bool replaceExisting = request.value(QStringLiteral("replace")).toBool(true);
+
+    uint32_t loadedCount = 0;
+    uint32_t skippedCount = 0;
+    if (!CoreDebuggerLoadSymbolFile(path.toStdString(), replaceExisting, loadedCount, skippedCount))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    CoreDebuggerSymbolStats stats;
+    CoreDebuggerGetSymbolStats(stats);
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("path"), path},
+                              {QStringLiteral("replace"), replaceExisting},
+                              {QStringLiteral("loaded_count"), static_cast<int>(loadedCount)},
+                              {QStringLiteral("skipped_count"), static_cast<int>(skippedCount)},
+                              {QStringLiteral("symbol_count"), static_cast<int>(stats.symbolCount)},
+                              {QStringLiteral("source_count"), static_cast<int>(stats.sourceCount)},
+                          });
+}
+
+QJsonObject McpBridgeServer::handleClearSymbols(const QJsonObject& request) const
+{
+    CoreDebuggerClearSymbols();
+    return makeOkResponse(request, QJsonObject{{QStringLiteral("cleared"), true}});
+}
+
+QJsonObject McpBridgeServer::handleSymbolStatus(const QJsonObject& request) const
+{
+    CoreDebuggerSymbolStats stats;
+    if (!CoreDebuggerGetSymbolStats(stats))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    QJsonArray sources;
+    for (const std::string& source : stats.sources)
+    {
+        sources.append(QString::fromStdString(source));
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("symbol_count"), static_cast<int>(stats.symbolCount)},
+                              {QStringLiteral("source_count"), static_cast<int>(stats.sourceCount)},
+                              {QStringLiteral("sources"), sources},
+                          });
+}
+
+QJsonObject McpBridgeServer::handleResolveSymbol(const QJsonObject& request) const
+{
+    QString addressText = request.value(QStringLiteral("address")).toString().trimmed();
+    if (addressText.isEmpty())
+    {
+        addressText = request.value(QStringLiteral("address_hex")).toString().trimmed();
+    }
+
+    quint32 address = 0;
+    if (!tryParseHexU32(addressText, &address))
+    {
+        return makeErrorResponse(request, QStringLiteral("Invalid address: %1").arg(addressText));
+    }
+
+    CoreDebuggerResolvedSymbol symbol;
+    if (!CoreDebuggerResolveSymbol(address, symbol))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    return makeOkResponse(request, resolvedSymbolToJson(symbol));
+}
+
+QJsonObject McpBridgeServer::handleLookupSymbol(const QJsonObject& request) const
+{
+    QString query = request.value(QStringLiteral("query")).toString().trimmed();
+    if (query.isEmpty())
+    {
+        query = request.value(QStringLiteral("name")).toString().trimmed();
+    }
+
+    if (query.isEmpty())
+    {
+        return makeErrorResponse(request, QStringLiteral("Missing required field: query"));
+    }
+
+    int limitValue = request.value(QStringLiteral("limit")).toInt(static_cast<int>(kMaxSymbolLookupResults));
+    if (limitValue <= 0 || limitValue > static_cast<int>(kMaxSymbolLookupResults))
+    {
+        return makeErrorResponse(request,
+                                 QStringLiteral("Invalid limit. Expected 1..%1.")
+                                     .arg(static_cast<int>(kMaxSymbolLookupResults)));
+    }
+
+    std::vector<CoreDebuggerSymbol> symbols;
+    if (!CoreDebuggerLookupSymbols(query.toStdString(), static_cast<uint32_t>(limitValue), symbols))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    QJsonArray payload;
+    for (const CoreDebuggerSymbol& symbol : symbols)
+    {
+        payload.append(symbolToJson(symbol));
+    }
+
+    return makeOkResponse(request, payload);
+}
+
+QJsonObject McpBridgeServer::handleGetDebugEvents(const QJsonObject& request) const
+{
+    quint64 sinceId = request.value(QStringLiteral("since_id")).toVariant().toULongLong();
+    int limitValue = request.value(QStringLiteral("limit")).toInt(100);
+    if (limitValue <= 0 || limitValue > static_cast<int>(kMaxEventResults))
+    {
+        return makeErrorResponse(request,
+                                 QStringLiteral("Invalid limit. Expected 1..%1.")
+                                     .arg(static_cast<int>(kMaxEventResults)));
+    }
+
+    QStringList filters = requestEventTypeFilter(request);
+
+    std::vector<CoreDebuggerEvent> events;
+    uint64_t latestId = 0;
+    const uint32_t fetchLimit = filters.isEmpty()
+                                    ? static_cast<uint32_t>(limitValue)
+                                    : static_cast<uint32_t>(kMaxEventResults);
+    if (!CoreDebuggerGetEvents(sinceId, fetchLimit, events, latestId))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    QJsonArray payload;
+    for (const CoreDebuggerEvent& event : events)
+    {
+        if (!eventMatchesFilters(event, filters))
+        {
+            continue;
+        }
+
+        payload.append(eventToJson(event));
+        if (payload.size() >= limitValue)
+        {
+            break;
+        }
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("events"), payload},
+                              {QStringLiteral("latest_id"), QString::number(latestId)},
+                              {QStringLiteral("returned_count"), payload.size()},
+                          });
+}
+
+QJsonObject McpBridgeServer::handleConfigureEventStream(const QJsonObject& request)
+{
+    QWebSocket* socket = qobject_cast<QWebSocket*>(sender());
+    if (socket == nullptr)
+    {
+        return makeErrorResponse(request, QStringLiteral("Event stream configuration requires a live WebSocket client"));
+    }
+
+    const bool enabled = request.value(QStringLiteral("enabled")).toBool(true);
+    if (enabled)
+    {
+        EventStreamSubscription subscription;
+        subscription.includeVi = request.value(QStringLiteral("include_vi")).toBool(false);
+        subscription.filters = requestEventTypeFilter(request);
+        this->eventSubscribers.insert(socket, subscription);
+
+        CoreDebuggerEventStats stats;
+        CoreDebuggerGetEventStats(stats);
+        this->lastBroadcastEventId = std::max<quint64>(this->lastBroadcastEventId, stats.latestId);
+    }
+    else
+    {
+        this->eventSubscribers.remove(socket);
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("enabled"), enabled},
+                              {QStringLiteral("subscriber_count"), this->eventSubscribers.size()},
+                              {QStringLiteral("include_vi"), enabled ? this->eventSubscribers.value(socket).includeVi : false},
+                              {QStringLiteral("filters"), QJsonArray::fromStringList(enabled ? this->eventSubscribers.value(socket).filters
+                                                                                           : QStringList{})},
+                              {QStringLiteral("streaming"), !this->eventSubscribers.isEmpty()},
+                          });
 }
 
 bool McpBridgeServer::tryParseHexU32(QString text, quint32* value)
@@ -892,6 +1291,55 @@ QJsonArray McpBridgeServer::breakpointKindsToJson(quint32 flags)
     }
 
     return kinds;
+}
+
+QJsonObject McpBridgeServer::symbolToJson(const CoreDebuggerSymbol& symbol)
+{
+    return QJsonObject{
+        {QStringLiteral("address"), u32ToHexString(symbol.address)},
+        {QStringLiteral("size"), static_cast<int>(symbol.size)},
+        {QStringLiteral("name"), QString::fromStdString(symbol.name)},
+        {QStringLiteral("source"), QString::fromStdString(symbol.source)},
+    };
+}
+
+QJsonObject McpBridgeServer::resolvedSymbolToJson(const CoreDebuggerResolvedSymbol& symbol)
+{
+    return QJsonObject{
+        {QStringLiteral("found"), symbol.found},
+        {QStringLiteral("exact"), symbol.exact},
+        {QStringLiteral("query_address"), u32ToHexString(symbol.queryAddress)},
+        {QStringLiteral("symbol_address"), u32ToHexString(symbol.symbolAddress)},
+        {QStringLiteral("offset"), u32ToHexString(symbol.offset)},
+        {QStringLiteral("size"), static_cast<int>(symbol.size)},
+        {QStringLiteral("name"), QString::fromStdString(symbol.name)},
+        {QStringLiteral("source"), QString::fromStdString(symbol.source)},
+    };
+}
+
+QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
+{
+    CoreDebuggerResolvedSymbol pcSymbol;
+    CoreDebuggerResolveSymbol(event.pc, pcSymbol);
+
+    CoreDebuggerResolvedSymbol addressSymbol;
+    CoreDebuggerResolveSymbol(event.address, addressSymbol);
+
+    return QJsonObject{
+        {QStringLiteral("id"), QString::number(event.id)},
+        {QStringLiteral("timestamp_ms"), QString::number(event.timestampMs)},
+        {QStringLiteral("type"), QString::fromStdString(event.type)},
+        {QStringLiteral("message"), QString::fromStdString(event.message)},
+        {QStringLiteral("run_state"), runStateToString(event.runState)},
+        {QStringLiteral("run_state_raw"), event.runState},
+        {QStringLiteral("pc"), u32ToHexString(event.pc)},
+        {QStringLiteral("pc_symbol"), resolvedSymbolToJson(pcSymbol)},
+        {QStringLiteral("address"), u32ToHexString(event.address)},
+        {QStringLiteral("address_symbol"), resolvedSymbolToJson(addressSymbol)},
+        {QStringLiteral("end_address"), u32ToHexString(event.endAddress)},
+        {QStringLiteral("flags"), breakpointFlagsToString(event.flags)},
+        {QStringLiteral("kinds"), breakpointKindsToJson(event.flags)},
+    };
 }
 
 QJsonArray McpBridgeServer::instructionListToJson(const QJsonArray& instructions)
