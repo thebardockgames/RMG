@@ -2175,6 +2175,9 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
     CoreDebuggerResolvedSymbol addressSymbol;
     CoreDebuggerResolveSymbol(event.address, addressSymbol);
 
+    CoreDebuggerResolvedSymbol rangeSymbol;
+    CoreDebuggerResolveSymbol(event.rangeAddress, rangeSymbol);
+
     QJsonObject instructionPayload;
     quint32 pcPhysicalAddress = 0;
     if (event.pc != 0)
@@ -2221,6 +2224,8 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
         {QStringLiteral("pc_symbol"), resolvedSymbolToJson(pcSymbol)},
         {QStringLiteral("address"), u32ToHexString(event.address)},
         {QStringLiteral("address_symbol"), resolvedSymbolToJson(addressSymbol)},
+        {QStringLiteral("range_address"), u32ToHexString(event.rangeAddress)},
+        {QStringLiteral("range_symbol"), resolvedSymbolToJson(rangeSymbol)},
         {QStringLiteral("end_address"), u32ToHexString(event.endAddress)},
         {QStringLiteral("flags"), breakpointFlagsToString(event.flags)},
         {QStringLiteral("kinds"), breakpointKindsToJson(event.flags)},
@@ -2229,6 +2234,48 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
     if (!instructionPayload.isEmpty())
     {
         payload.insert(QStringLiteral("instruction"), instructionPayload);
+    }
+
+    if (event.registerSnapshot.valid || event.memorySnapshot.valid)
+    {
+        QJsonObject snapshotPayload;
+
+        if (event.registerSnapshot.valid)
+        {
+            snapshotPayload.insert(QStringLiteral("registers"),
+                                   QJsonObject{
+                                       {QStringLiteral("pc"), u64ToHexString(event.registerSnapshot.pc)},
+                                       {QStringLiteral("ra"), u64ToHexString(event.registerSnapshot.ra)},
+                                       {QStringLiteral("sp"), u64ToHexString(event.registerSnapshot.sp)},
+                                       {QStringLiteral("gp"), u64ToHexString(event.registerSnapshot.gp)},
+                                       {QStringLiteral("a0"), u64ToHexString(event.registerSnapshot.a0)},
+                                       {QStringLiteral("a1"), u64ToHexString(event.registerSnapshot.a1)},
+                                       {QStringLiteral("a2"), u64ToHexString(event.registerSnapshot.a2)},
+                                       {QStringLiteral("a3"), u64ToHexString(event.registerSnapshot.a3)},
+                                       {QStringLiteral("v0"), u64ToHexString(event.registerSnapshot.v0)},
+                                       {QStringLiteral("v1"), u64ToHexString(event.registerSnapshot.v1)},
+                                       {QStringLiteral("s0"), u64ToHexString(event.registerSnapshot.s0)},
+                                       {QStringLiteral("s1"), u64ToHexString(event.registerSnapshot.s1)},
+                                       {QStringLiteral("t0"), u64ToHexString(event.registerSnapshot.t0)},
+                                       {QStringLiteral("t1"), u64ToHexString(event.registerSnapshot.t1)},
+                                   });
+        }
+
+        if (event.memorySnapshot.valid)
+        {
+            snapshotPayload.insert(QStringLiteral("memory"),
+                                   QJsonObject{
+                                       {QStringLiteral("address"), u32ToHexString(event.memorySnapshot.address)},
+                                       {QStringLiteral("end_address"), u32ToHexString(event.memorySnapshot.endAddress)},
+                                       {QStringLiteral("size"), static_cast<int>(event.memorySnapshot.bytes.size())},
+                                       {QStringLiteral("truncated"), event.memorySnapshot.truncated},
+                                       {QStringLiteral("data"), bytesToHexString(QByteArray(
+                                                                   reinterpret_cast<const char*>(event.memorySnapshot.bytes.data()),
+                                                                   static_cast<qsizetype>(event.memorySnapshot.bytes.size())))},
+                                   });
+        }
+
+        payload.insert(QStringLiteral("snapshot"), snapshotPayload);
     }
 
     return payload;

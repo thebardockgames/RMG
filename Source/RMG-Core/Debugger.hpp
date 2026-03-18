@@ -68,6 +68,34 @@ struct CoreDebuggerSymbolStats
 
 struct CoreDebuggerEvent
 {
+    struct RegisterSnapshot
+    {
+        bool valid = false;
+        uint64_t pc = 0;
+        uint64_t ra = 0;
+        uint64_t sp = 0;
+        uint64_t gp = 0;
+        uint64_t a0 = 0;
+        uint64_t a1 = 0;
+        uint64_t a2 = 0;
+        uint64_t a3 = 0;
+        uint64_t v0 = 0;
+        uint64_t v1 = 0;
+        uint64_t s0 = 0;
+        uint64_t s1 = 0;
+        uint64_t t0 = 0;
+        uint64_t t1 = 0;
+    };
+
+    struct MemorySnapshot
+    {
+        bool valid = false;
+        bool truncated = false;
+        uint32_t address = 0;
+        uint32_t endAddress = 0;
+        std::vector<uint8_t> bytes;
+    };
+
     uint64_t id = 0;
     uint64_t timestampMs = 0;
     std::string type;
@@ -75,8 +103,11 @@ struct CoreDebuggerEvent
     int runState = 0;
     uint32_t pc = 0;
     uint32_t address = 0;
+    uint32_t rangeAddress = 0;
     uint32_t endAddress = 0;
     uint32_t flags = 0;
+    RegisterSnapshot registerSnapshot;
+    MemorySnapshot memorySnapshot;
 };
 
 struct CoreDebuggerEventStats

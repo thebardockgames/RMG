@@ -39,6 +39,7 @@ namespace
 constexpr uint32_t kMaxRdramSize = UINT32_C(0x00800000);
 constexpr uint32_t kMinInstructionSize = UINT32_C(4);
 constexpr uint32_t kMaxEventBatchSize = UINT32_C(1024);
+constexpr uint32_t kMaxWatchpointSnapshotBytes = UINT32_C(64);
 constexpr size_t kMaxQueuedEvents = 4096;
 constexpr uint64_t kViEventThrottleMs = 250;
 
@@ -255,12 +256,125 @@ void push_debugger_event(const std::string& type,
                          uint32_t pc,
                          uint32_t address,
                          uint32_t endAddress,
-                         uint32_t flags)
-{
-    std::scoped_lock lock(g_eventMutex);
+                         uint32_t flags,
+                         uint32_t rangeAddress = 0);
 
+bool capture_event_register_snapshot(CoreDebuggerEvent::RegisterSnapshot* snapshot)
+{
+    if (snapshot == nullptr)
+    {
+        return false;
+    }
+
+    *snapshot = {};
+    const std::array<std::pair<const char*, uint64_t*>, 14> registers = {
+        std::pair{"pc", &snapshot->pc},
+        std::pair{"ra", &snapshot->ra},
+        std::pair{"sp", &snapshot->sp},
+        std::pair{"gp", &snapshot->gp},
+        std::pair{"a0", &snapshot->a0},
+        std::pair{"a1", &snapshot->a1},
+        std::pair{"a2", &snapshot->a2},
+        std::pair{"a3", &snapshot->a3},
+        std::pair{"v0", &snapshot->v0},
+        std::pair{"v1", &snapshot->v1},
+        std::pair{"s0", &snapshot->s0},
+        std::pair{"s1", &snapshot->s1},
+        std::pair{"t0", &snapshot->t0},
+        std::pair{"t1", &snapshot->t1},
+    };
+
+    for (const auto& [name, value] : registers)
+    {
+        if (!CoreDebuggerReadCpuRegister(name, *value))
+        {
+            *snapshot = {};
+            return false;
+        }
+    }
+
+    snapshot->valid = true;
+    return true;
+}
+
+bool capture_event_memory_snapshot(uint32_t startAddress,
+                                   uint32_t endAddress,
+                                   CoreDebuggerEvent::MemorySnapshot* snapshot)
+{
+    if (snapshot == nullptr)
+    {
+        return false;
+    }
+
+    *snapshot = {};
+    if (endAddress < startAddress)
+    {
+        return false;
+    }
+
+    const uint64_t requestedSize = static_cast<uint64_t>(endAddress) - static_cast<uint64_t>(startAddress) + 1ULL;
+    const uint32_t readSize = static_cast<uint32_t>(std::min<uint64_t>(requestedSize, kMaxWatchpointSnapshotBytes));
+
+    std::vector<uint8_t> bytes;
+    if (!CoreDebuggerReadMemory(startAddress, readSize, bytes))
+    {
+        return false;
+    }
+
+    snapshot->valid = true;
+    snapshot->truncated = requestedSize > readSize;
+    snapshot->address = startAddress;
+    snapshot->endAddress = static_cast<uint32_t>(startAddress + readSize - 1);
+    snapshot->bytes = std::move(bytes);
+    return true;
+}
+
+bool lookup_managed_breakpoint_range(uint32_t address, uint32_t flags, CoreDebuggerBreakpoint* breakpoint)
+{
+    if (breakpoint == nullptr)
+    {
+        return false;
+    }
+
+    std::scoped_lock lock(g_breakpointMutex);
+
+    bool found = false;
+    uint32_t bestSize = UINT32_MAX;
+    const uint32_t kindMask = flags & (M64P_BKP_FLAG_EXEC | M64P_BKP_FLAG_READ | M64P_BKP_FLAG_WRITE);
+    for (const CoreDebuggerBreakpoint& candidate : g_managedBreakpoints)
+    {
+        if (address < candidate.address || address > candidate.endAddress)
+        {
+            continue;
+        }
+
+        if (kindMask != 0 && (candidate.flags & kindMask) == 0)
+        {
+            continue;
+        }
+
+        const uint32_t candidateSize = candidate.endAddress - candidate.address;
+        if (!found || candidateSize < bestSize)
+        {
+            *breakpoint = candidate;
+            bestSize = candidateSize;
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+void push_debugger_event(const std::string& type,
+                         const std::string& message,
+                         int runState,
+                         uint32_t pc,
+                         uint32_t address,
+                         uint32_t endAddress,
+                         uint32_t flags,
+                         uint32_t rangeAddress)
+{
     CoreDebuggerEvent event;
-    event.id = g_nextEventId++;
     event.timestampMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                   std::chrono::system_clock::now().time_since_epoch())
                                                   .count());
@@ -269,8 +383,24 @@ void push_debugger_event(const std::string& type,
     event.runState = runState;
     event.pc = pc;
     event.address = address;
+    event.rangeAddress = rangeAddress == 0 ? address : rangeAddress;
     event.endAddress = endAddress;
     event.flags = flags;
+
+    const bool shouldCaptureRegisterSnapshot = type == "debugger.watchpoint_hit" ||
+                                               type == "debugger.breakpoint_hit";
+    if (shouldCaptureRegisterSnapshot)
+    {
+        capture_event_register_snapshot(&event.registerSnapshot);
+    }
+
+    if (type == "debugger.watchpoint_hit")
+    {
+        capture_event_memory_snapshot(event.rangeAddress, event.endAddress, &event.memorySnapshot);
+    }
+
+    std::scoped_lock lock(g_eventMutex);
+    event.id = g_nextEventId++;
 
     g_events.push_back(std::move(event));
     while (g_events.size() > kMaxQueuedEvents)
@@ -327,6 +457,10 @@ void debugger_ui_update_callback(unsigned int pc)
              breakpointAddress != g_lastTriggeredAddress ||
              static_cast<uint32_t>(pc) != g_lastTriggeredPc))
         {
+            CoreDebuggerBreakpoint matchedBreakpoint;
+            const bool hasMatchedBreakpoint = lookup_managed_breakpoint_range(breakpointAddress,
+                                                                              breakpointFlags,
+                                                                              &matchedBreakpoint);
             std::string eventType = (breakpointFlags & (M64P_BKP_FLAG_READ | M64P_BKP_FLAG_WRITE)) != 0
                                         ? "debugger.watchpoint_hit"
                                         : "debugger.breakpoint_hit";
@@ -336,8 +470,9 @@ void debugger_ui_update_callback(unsigned int pc)
                                 runState,
                                 static_cast<uint32_t>(pc),
                                 breakpointAddress,
-                                breakpointAddress,
-                                breakpointFlags);
+                                hasMatchedBreakpoint ? matchedBreakpoint.endAddress : breakpointAddress,
+                                breakpointFlags,
+                                hasMatchedBreakpoint ? matchedBreakpoint.address : breakpointAddress);
 
             g_lastTriggeredFlags = breakpointFlags;
             g_lastTriggeredAddress = breakpointAddress;
