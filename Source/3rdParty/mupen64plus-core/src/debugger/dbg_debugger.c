@@ -44,6 +44,7 @@ typedef SDL_Semaphore SDL_sem;
 #ifdef DBG
 
 int g_DebuggerActive = 0;    // whether the debugger is enabled or not
+int g_DebuggerTraceEnabled = 0; // whether the front-end requested per-instruction callbacks while running
 
 m64p_dbg_runstate g_dbg_runstate;
 
@@ -66,6 +67,7 @@ void init_debugger()
     }
     
     g_DebuggerActive = 1;
+    g_DebuggerTraceEnabled = 0;
     g_dbg_runstate = M64P_DBG_RUNSTATE_PAUSED;
 
     DebuggerCallback(DEBUG_UI_INIT, 0); /* call front-end to initialize user interface */
@@ -80,6 +82,7 @@ void destroy_debugger()
     SDL_DestroySemaphore(sem_pending_steps);
     sem_pending_steps = NULL;
     g_DebuggerActive = 0;
+    g_DebuggerTraceEnabled = 0;
 }
 
 //]=-=-=-=-=-=-=-=-=-=-=-=-=[ Mise-a-Jour Debugger ]=-=-=-=-=-=-=-=-=-=-=-=-=[
@@ -103,7 +106,7 @@ void update_debugger(uint32_t pc)
         }
     }
 
-    if (g_dbg_runstate != M64P_DBG_RUNSTATE_RUNNING) {
+    if (g_dbg_runstate != M64P_DBG_RUNSTATE_RUNNING || g_DebuggerTraceEnabled) {
         DebuggerCallback(DEBUG_UI_UPDATE, pc);  /* call front-end to notify user interface to update */
     }
     if (g_dbg_runstate == M64P_DBG_RUNSTATE_PAUSED) {

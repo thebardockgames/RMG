@@ -94,6 +94,11 @@ class McpBridgeServer : public QObject
     QJsonObject handleResolveSymbol(const QJsonObject& request) const;
     QJsonObject handleLookupSymbol(const QJsonObject& request) const;
     QJsonObject handleGetDebugEvents(const QJsonObject& request) const;
+    QJsonObject handleStartInstructionTrace(const QJsonObject& request) const;
+    QJsonObject handleStopInstructionTrace(const QJsonObject& request) const;
+    QJsonObject handleClearInstructionTrace(const QJsonObject& request) const;
+    QJsonObject handleGetInstructionTraceStatus(const QJsonObject& request) const;
+    QJsonObject handleGetInstructionTrace(const QJsonObject& request) const;
     QJsonObject handleConfigureEventStream(const QJsonObject& request);
 
     static bool tryParseHexU32(QString text, quint32* value);
@@ -110,6 +115,8 @@ class McpBridgeServer : public QObject
     static QJsonObject symbolToJson(const CoreDebuggerSymbol& symbol);
     static QJsonObject resolvedSymbolToJson(const CoreDebuggerResolvedSymbol& symbol);
     static QJsonObject eventToJson(const CoreDebuggerEvent& event);
+    static QJsonObject instructionTraceStatusToJson(const CoreDebuggerInstructionTraceStatus& status);
+    static QJsonObject instructionTraceRecordToJson(const CoreDebuggerInstructionTraceRecord& record);
     static QJsonObject makeOkResponse(const QJsonObject& request, const QJsonValue& data);
     static QJsonObject makeErrorResponse(const QJsonObject& request, const QString& message);
     static void copyRequestId(const QJsonObject& request, QJsonObject* response);

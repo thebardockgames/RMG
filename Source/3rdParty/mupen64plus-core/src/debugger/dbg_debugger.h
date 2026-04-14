@@ -26,6 +26,7 @@
 #include "api/m64p_types.h"
 
 extern int g_DebuggerActive;  /* True if the debugger is running */
+extern int g_DebuggerTraceEnabled; /* True when continuous trace callbacks are enabled */
 
 extern m64p_dbg_runstate g_dbg_runstate;
 

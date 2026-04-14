@@ -128,6 +128,16 @@ EXPORT m64p_error CALL DebugSetRunState(m64p_dbg_runstate runstate)
 #endif
 }
 
+EXPORT m64p_error CALL DebugSetTraceEnabled(int enabled)
+{
+#ifdef DBG
+    g_DebuggerTraceEnabled = enabled ? 1 : 0;
+    return M64ERR_SUCCESS;
+#else
+    return M64ERR_UNSUPPORTED;
+#endif
+}
+
 EXPORT int CALL DebugGetState(m64p_dbg_state statenum)
 {
 #ifdef DBG

@@ -31,6 +31,8 @@ bool DebuggerApi::Hook(m64p_dynlib_handle handle)
         reinterpret_cast<ptr_DebugSetCoreCompare>(CoreGetLibrarySymbol(handle, "DebugSetCoreCompare"));
     this->DebugSetRunState =
         reinterpret_cast<ptr_DebugSetRunState>(CoreGetLibrarySymbol(handle, "DebugSetRunState"));
+    this->DebugSetTraceEnabled =
+        reinterpret_cast<ptr_DebugSetTraceEnabled>(CoreGetLibrarySymbol(handle, "DebugSetTraceEnabled"));
     this->DebugGetState =
         reinterpret_cast<ptr_DebugGetState>(CoreGetLibrarySymbol(handle, "DebugGetState"));
     this->DebugStep =
@@ -90,6 +92,7 @@ bool DebuggerApi::Unhook(void)
     this->DebugSetCallbacks = nullptr;
     this->DebugSetCoreCompare = nullptr;
     this->DebugSetRunState = nullptr;
+    this->DebugSetTraceEnabled = nullptr;
     this->DebugGetState = nullptr;
     this->DebugStep = nullptr;
     this->DebugDecodeOp = nullptr;

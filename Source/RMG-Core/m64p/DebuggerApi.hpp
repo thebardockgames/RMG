@@ -35,6 +35,7 @@ class DebuggerApi
     ptr_DebugSetCallbacks DebugSetCallbacks;
     ptr_DebugSetCoreCompare DebugSetCoreCompare;
     ptr_DebugSetRunState DebugSetRunState;
+    ptr_DebugSetTraceEnabled DebugSetTraceEnabled;
     ptr_DebugGetState DebugGetState;
     ptr_DebugStep DebugStep;
     ptr_DebugDecodeOp DebugDecodeOp;

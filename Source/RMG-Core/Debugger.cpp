@@ -40,6 +40,8 @@ constexpr uint32_t kMaxRdramSize = UINT32_C(0x00800000);
 constexpr uint32_t kMinInstructionSize = UINT32_C(4);
 constexpr uint32_t kMaxEventBatchSize = UINT32_C(1024);
 constexpr uint32_t kMaxWatchpointSnapshotBytes = UINT32_C(64);
+constexpr uint32_t kDefaultInstructionTraceMaxRecords = UINT32_C(2000000);
+constexpr uint32_t kMaxInstructionTraceBatchSize = UINT32_C(50000);
 constexpr size_t kMaxQueuedEvents = 4096;
 constexpr uint64_t kViEventThrottleMs = 250;
 
@@ -51,6 +53,10 @@ std::set<std::string> g_symbolSources;
 std::mutex g_eventMutex;
 std::deque<CoreDebuggerEvent> g_events;
 uint64_t g_nextEventId = 1;
+std::mutex g_instructionTraceMutex;
+std::vector<CoreDebuggerInstructionTraceRecord> g_instructionTrace;
+CoreDebuggerInstructionTraceStatus g_instructionTraceStatus;
+uint32_t g_instructionTraceMaxRecords = 0;
 uint32_t g_lastCallbackPc = 0;
 int g_lastObservedRunState = -1;
 uint32_t g_lastTriggeredAddress = 0;
@@ -258,6 +264,11 @@ void push_debugger_event(const std::string& type,
                          uint32_t endAddress,
                          uint32_t flags,
                          uint32_t rangeAddress = 0);
+void set_error_from_m64p(const std::string& prefix, m64p_error ret);
+bool set_debugger_trace_enabled(bool enabled);
+uint64_t monotonic_timestamp_us(void);
+uint32_t classify_trace_record_flags(uint32_t pc, uint32_t word, uint32_t* branchTarget, bool* hasBranchTarget);
+void capture_instruction_trace_record(uint32_t pc);
 
 bool capture_event_register_snapshot(CoreDebuggerEvent::RegisterSnapshot* snapshot)
 {
@@ -267,11 +278,16 @@ bool capture_event_register_snapshot(CoreDebuggerEvent::RegisterSnapshot* snapsh
     }
 
     *snapshot = {};
-    const std::array<std::pair<const char*, uint64_t*>, 14> registers = {
+    const std::array<std::pair<const char*, uint64_t*>, 35> registers = {
         std::pair{"pc", &snapshot->pc},
+        std::pair{"zero", &snapshot->zero},
+        std::pair{"at", &snapshot->at},
+        std::pair{"hi", &snapshot->hi},
+        std::pair{"lo", &snapshot->lo},
         std::pair{"ra", &snapshot->ra},
         std::pair{"sp", &snapshot->sp},
         std::pair{"gp", &snapshot->gp},
+        std::pair{"s8", &snapshot->fp},
         std::pair{"a0", &snapshot->a0},
         std::pair{"a1", &snapshot->a1},
         std::pair{"a2", &snapshot->a2},
@@ -280,8 +296,24 @@ bool capture_event_register_snapshot(CoreDebuggerEvent::RegisterSnapshot* snapsh
         std::pair{"v1", &snapshot->v1},
         std::pair{"s0", &snapshot->s0},
         std::pair{"s1", &snapshot->s1},
+        std::pair{"s2", &snapshot->s2},
+        std::pair{"s3", &snapshot->s3},
+        std::pair{"s4", &snapshot->s4},
+        std::pair{"s5", &snapshot->s5},
+        std::pair{"s6", &snapshot->s6},
+        std::pair{"s7", &snapshot->s7},
         std::pair{"t0", &snapshot->t0},
         std::pair{"t1", &snapshot->t1},
+        std::pair{"t2", &snapshot->t2},
+        std::pair{"t3", &snapshot->t3},
+        std::pair{"t4", &snapshot->t4},
+        std::pair{"t5", &snapshot->t5},
+        std::pair{"t6", &snapshot->t6},
+        std::pair{"t7", &snapshot->t7},
+        std::pair{"t8", &snapshot->t8},
+        std::pair{"t9", &snapshot->t9},
+        std::pair{"k0", &snapshot->k0},
+        std::pair{"k1", &snapshot->k1},
     };
 
     for (const auto& [name, value] : registers)
@@ -409,6 +441,188 @@ void push_debugger_event(const std::string& type,
     }
 }
 
+bool set_debugger_trace_enabled(bool enabled)
+{
+    if (!m64p::Debugger.IsHooked() ||
+        m64p::Debugger.DebugSetTraceEnabled == nullptr)
+    {
+        CoreSetError("Core debugger trace API unavailable");
+        return false;
+    }
+
+    const m64p_error ret = m64p::Debugger.DebugSetTraceEnabled(enabled ? 1 : 0);
+    if (ret != M64ERR_SUCCESS)
+    {
+        set_error_from_m64p("CoreDebuggerTrace Failed: ", ret);
+        return false;
+    }
+
+    return true;
+}
+
+uint64_t monotonic_timestamp_us(void)
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+
+uint32_t classify_trace_record_flags(uint32_t pc, uint32_t word, uint32_t* branchTarget, bool* hasBranchTarget)
+{
+    if (branchTarget != nullptr)
+    {
+        *branchTarget = 0;
+    }
+    if (hasBranchTarget != nullptr)
+    {
+        *hasBranchTarget = false;
+    }
+
+    const uint32_t opcode = (word >> 26) & UINT32_C(0x3f);
+    const uint32_t rs = (word >> 21) & UINT32_C(0x1f);
+    const uint32_t rt = (word >> 16) & UINT32_C(0x1f);
+    const uint32_t funct = word & UINT32_C(0x3f);
+    const int32_t signedImmediate = static_cast<int16_t>(word & UINT32_C(0xffff));
+    const uint32_t jumpTarget = (pc & UINT32_C(0xf0000000)) | ((word & UINT32_C(0x03ffffff)) << 2);
+    const uint32_t branchAddress = static_cast<uint32_t>(pc + 4 + (signedImmediate << 2));
+
+    auto setDirectTarget = [branchTarget, hasBranchTarget](uint32_t target) {
+        if (branchTarget != nullptr)
+        {
+            *branchTarget = target;
+        }
+        if (hasBranchTarget != nullptr)
+        {
+            *hasBranchTarget = true;
+        }
+    };
+
+    uint32_t flags = 0;
+    switch (opcode)
+    {
+        case 0x00:
+            if (funct == 0x08)
+            {
+                flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW | CORE_DEBUGGER_TRACE_FLAG_INDIRECT;
+                if (rs == 31)
+                {
+                    flags |= CORE_DEBUGGER_TRACE_FLAG_RETURN;
+                }
+                break;
+            }
+            if (funct == 0x09)
+            {
+                flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW |
+                        CORE_DEBUGGER_TRACE_FLAG_CALL |
+                        CORE_DEBUGGER_TRACE_FLAG_INDIRECT |
+                        CORE_DEBUGGER_TRACE_FLAG_LINK;
+                break;
+            }
+            break;
+        case 0x01:
+            if (rt == 0x00 || rt == 0x01)
+            {
+                flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW |
+                        CORE_DEBUGGER_TRACE_FLAG_BRANCH |
+                        CORE_DEBUGGER_TRACE_FLAG_CONDITIONAL;
+                setDirectTarget(branchAddress);
+            }
+            else if (rt == 0x10 || rt == 0x11)
+            {
+                flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW |
+                        CORE_DEBUGGER_TRACE_FLAG_BRANCH |
+                        CORE_DEBUGGER_TRACE_FLAG_CONDITIONAL |
+                        CORE_DEBUGGER_TRACE_FLAG_CALL |
+                        CORE_DEBUGGER_TRACE_FLAG_LINK;
+                setDirectTarget(branchAddress);
+            }
+            break;
+        case 0x02:
+            flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW;
+            setDirectTarget(jumpTarget);
+            break;
+        case 0x03:
+            flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW |
+                    CORE_DEBUGGER_TRACE_FLAG_CALL |
+                    CORE_DEBUGGER_TRACE_FLAG_LINK;
+            setDirectTarget(jumpTarget);
+            break;
+        case 0x04:
+        case 0x05:
+        case 0x06:
+        case 0x07:
+        case 0x14:
+        case 0x15:
+        case 0x16:
+        case 0x17:
+            flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW |
+                    CORE_DEBUGGER_TRACE_FLAG_BRANCH |
+                    CORE_DEBUGGER_TRACE_FLAG_CONDITIONAL;
+            setDirectTarget(branchAddress);
+            break;
+        case 0x10:
+            if (rs == 0x10 && funct == 0x18)
+            {
+                flags = CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW |
+                        CORE_DEBUGGER_TRACE_FLAG_RETURN |
+                        CORE_DEBUGGER_TRACE_FLAG_EXCEPTION_RETURN;
+            }
+            break;
+        default:
+            break;
+    }
+
+    return flags;
+}
+
+void capture_instruction_trace_record(uint32_t pc)
+{
+    CoreDebuggerInstructionTraceRecord record;
+    record.index = 0;
+    record.timestampUs = monotonic_timestamp_us();
+    record.pc = pc;
+
+    if (m64p::Debugger.DebugMemRead32 != nullptr)
+    {
+        record.word = static_cast<uint32_t>(m64p::Debugger.DebugMemRead32(pc));
+    }
+
+    record.flags = classify_trace_record_flags(pc, record.word, &record.branchTarget, &record.hasBranchTarget);
+
+    std::scoped_lock lock(g_instructionTraceMutex);
+    if (!g_instructionTraceStatus.active)
+    {
+        return;
+    }
+
+    if (g_instructionTraceStatus.totalCaptured == 0)
+    {
+        g_instructionTraceStatus.startTimestampUs = record.timestampUs;
+    }
+    g_instructionTraceStatus.latestTimestampUs = record.timestampUs;
+
+    if (!g_instructionTrace.empty())
+    {
+        g_instructionTrace.back().nextPc = pc;
+        g_instructionTrace.back().hasNextPc = true;
+    }
+
+    if (g_instructionTraceMaxRecords != 0 &&
+        g_instructionTrace.size() >= g_instructionTraceMaxRecords)
+    {
+        g_instructionTraceStatus.truncated = true;
+        g_instructionTraceStatus.active = false;
+        g_instructionTraceStatus.droppedRecords++;
+        set_debugger_trace_enabled(false);
+        return;
+    }
+
+    record.index = g_instructionTraceStatus.totalCaptured;
+    g_instructionTrace.push_back(record);
+    g_instructionTraceStatus.totalCaptured++;
+    g_instructionTraceStatus.bufferedCount = static_cast<uint32_t>(g_instructionTrace.size());
+}
+
 void debugger_ui_init_callback(void)
 {
     g_lastObservedRunState = -1;
@@ -430,19 +644,26 @@ void debugger_ui_update_callback(unsigned int pc)
     }
 
     int runState = m64p::Debugger.DebugGetState(M64P_DBG_RUN_STATE);
-    if (runState != g_lastObservedRunState ||
-        static_cast<uint32_t>(pc) != g_lastCallbackPc)
+    const uint32_t callbackPc = static_cast<uint32_t>(pc);
+    const bool traceActive = g_instructionTraceStatus.active;
+    if (traceActive && runState == M64P_DBG_RUNSTATE_RUNNING)
+    {
+        capture_instruction_trace_record(callbackPc);
+    }
+
+    if ((!traceActive || runState != M64P_DBG_RUNSTATE_RUNNING) &&
+        (runState != g_lastObservedRunState || callbackPc != g_lastCallbackPc))
     {
         push_debugger_event("debugger.update",
                             "Debugger UI update callback",
                             runState,
-                            static_cast<uint32_t>(pc),
+                            callbackPc,
                             0,
                             0,
                             0);
         g_lastObservedRunState = runState;
-        g_lastCallbackPc = static_cast<uint32_t>(pc);
     }
+    g_lastCallbackPc = callbackPc;
 
     if (m64p::Debugger.DebugBreakpointTriggeredBy != nullptr)
     {
@@ -455,7 +676,7 @@ void debugger_ui_update_callback(unsigned int pc)
             (breakpointFlags != 0 || breakpointAddress != 0) &&
             (breakpointFlags != g_lastTriggeredFlags ||
              breakpointAddress != g_lastTriggeredAddress ||
-             static_cast<uint32_t>(pc) != g_lastTriggeredPc))
+             callbackPc != g_lastTriggeredPc))
         {
             CoreDebuggerBreakpoint matchedBreakpoint;
             const bool hasMatchedBreakpoint = lookup_managed_breakpoint_range(breakpointAddress,
@@ -468,7 +689,7 @@ void debugger_ui_update_callback(unsigned int pc)
             push_debugger_event(eventType,
                                 "Debugger breakpoint/watchpoint triggered",
                                 runState,
-                                static_cast<uint32_t>(pc),
+                                callbackPc,
                                 breakpointAddress,
                                 hasMatchedBreakpoint ? matchedBreakpoint.endAddress : breakpointAddress,
                                 breakpointFlags,
@@ -476,7 +697,7 @@ void debugger_ui_update_callback(unsigned int pc)
 
             g_lastTriggeredFlags = breakpointFlags;
             g_lastTriggeredAddress = breakpointAddress;
-            g_lastTriggeredPc = static_cast<uint32_t>(pc);
+            g_lastTriggeredPc = callbackPc;
             g_breakpointEventsArmed = false;
         }
         else if (!g_breakpointEventsArmed)
@@ -1153,6 +1374,12 @@ CORE_EXPORT bool CoreDebuggerConfigureCallbacks(void)
 
 CORE_EXPORT void CoreDebuggerResetSession(void)
 {
+    if (m64p::Debugger.IsHooked() &&
+        m64p::Debugger.DebugSetTraceEnabled != nullptr)
+    {
+        m64p::Debugger.DebugSetTraceEnabled(0);
+    }
+
     {
         std::scoped_lock lock(g_breakpointMutex);
         g_managedBreakpoints.clear();
@@ -1162,6 +1389,13 @@ CORE_EXPORT void CoreDebuggerResetSession(void)
         std::scoped_lock lock(g_eventMutex);
         g_events.clear();
         g_nextEventId = 1;
+    }
+
+    {
+        std::scoped_lock lock(g_instructionTraceMutex);
+        g_instructionTrace.clear();
+        g_instructionTraceStatus = {};
+        g_instructionTraceMaxRecords = 0;
     }
 
     g_lastCallbackPc = 0;
@@ -2067,6 +2301,122 @@ CORE_EXPORT bool CoreDebuggerGetEvents(uint64_t sinceId,
         {
             break;
         }
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerStartInstructionTrace(uint32_t maxRecords, bool clearExisting)
+{
+    if (!ensure_debugger_available())
+    {
+        return false;
+    }
+
+    if (maxRecords == 0)
+    {
+        maxRecords = kDefaultInstructionTraceMaxRecords;
+    }
+
+    {
+        std::scoped_lock lock(g_instructionTraceMutex);
+        if (clearExisting)
+        {
+            g_instructionTrace.clear();
+            g_instructionTraceStatus = {};
+        }
+
+        g_instructionTrace.reserve(std::max<size_t>(g_instructionTrace.capacity(), maxRecords));
+        g_instructionTraceMaxRecords = maxRecords;
+        g_instructionTraceStatus.active = true;
+        g_instructionTraceStatus.truncated = false;
+        g_instructionTraceStatus.maxRecords = maxRecords;
+        if (g_instructionTraceStatus.startTimestampUs == 0)
+        {
+            g_instructionTraceStatus.startTimestampUs = monotonic_timestamp_us();
+        }
+    }
+
+    return set_debugger_trace_enabled(true);
+}
+
+CORE_EXPORT bool CoreDebuggerStopInstructionTrace(void)
+{
+    if (!m64p::Debugger.IsHooked() ||
+        m64p::Debugger.DebugSetTraceEnabled == nullptr)
+    {
+        CoreSetError("Core debugger trace API unavailable");
+        return false;
+    }
+
+    {
+        std::scoped_lock lock(g_instructionTraceMutex);
+        g_instructionTraceStatus.active = false;
+        if (g_instructionTraceStatus.latestTimestampUs == 0)
+        {
+            g_instructionTraceStatus.latestTimestampUs = monotonic_timestamp_us();
+        }
+    }
+
+    return set_debugger_trace_enabled(false);
+}
+
+CORE_EXPORT bool CoreDebuggerClearInstructionTrace(void)
+{
+    {
+        std::scoped_lock lock(g_instructionTraceMutex);
+        g_instructionTrace.clear();
+        g_instructionTraceStatus = {};
+        g_instructionTraceMaxRecords = 0;
+    }
+
+    if (m64p::Debugger.IsHooked() &&
+        m64p::Debugger.DebugSetTraceEnabled != nullptr)
+    {
+        m64p::Debugger.DebugSetTraceEnabled(0);
+    }
+
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerGetInstructionTraceStatus(CoreDebuggerInstructionTraceStatus& status)
+{
+    std::scoped_lock lock(g_instructionTraceMutex);
+    status = g_instructionTraceStatus;
+    status.bufferedCount = static_cast<uint32_t>(g_instructionTrace.size());
+    status.maxRecords = g_instructionTraceMaxRecords;
+    return true;
+}
+
+CORE_EXPORT bool CoreDebuggerGetInstructionTrace(uint64_t startIndex,
+                                                 uint32_t limit,
+                                                 std::vector<CoreDebuggerInstructionTraceRecord>& records,
+                                                 CoreDebuggerInstructionTraceStatus& status)
+{
+    records.clear();
+    if (limit == 0)
+    {
+        CoreSetError("CoreDebuggerGetInstructionTrace Failed: limit must be greater than zero");
+        return false;
+    }
+
+    limit = std::min(limit, kMaxInstructionTraceBatchSize);
+
+    std::scoped_lock lock(g_instructionTraceMutex);
+    status = g_instructionTraceStatus;
+    status.bufferedCount = static_cast<uint32_t>(g_instructionTrace.size());
+    status.maxRecords = g_instructionTraceMaxRecords;
+
+    if (startIndex >= g_instructionTrace.size())
+    {
+        return true;
+    }
+
+    const size_t endIndex = std::min<size_t>(g_instructionTrace.size(), static_cast<size_t>(startIndex + limit));
+    records.reserve(endIndex - static_cast<size_t>(startIndex));
+    for (size_t index = static_cast<size_t>(startIndex); index < endIndex; index++)
+    {
+        records.push_back(g_instructionTrace[index]);
     }
 
     return true;

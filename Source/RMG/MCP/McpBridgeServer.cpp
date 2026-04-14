@@ -36,6 +36,8 @@ constexpr quint32 kMaxStepCount = 1024;
 constexpr quint32 kMaxRunUntilTimeoutMs = 30000;
 constexpr quint32 kMaxSymbolLookupResults = 128;
 constexpr quint32 kMaxEventResults = 512;
+constexpr quint32 kDefaultInstructionTraceMaxRecords = 2000000;
+constexpr quint32 kMaxInstructionTraceResults = 50000;
 
 struct ResolvedRequestTarget
 {
@@ -1024,6 +1026,31 @@ QJsonObject McpBridgeServer::processRequest(const QJsonObject& request) const
         return this->handleGetDebugEvents(request);
     }
 
+    if (action == QStringLiteral("start_instruction_trace"))
+    {
+        return this->handleStartInstructionTrace(request);
+    }
+
+    if (action == QStringLiteral("stop_instruction_trace"))
+    {
+        return this->handleStopInstructionTrace(request);
+    }
+
+    if (action == QStringLiteral("clear_instruction_trace"))
+    {
+        return this->handleClearInstructionTrace(request);
+    }
+
+    if (action == QStringLiteral("instruction_trace_status"))
+    {
+        return this->handleGetInstructionTraceStatus(request);
+    }
+
+    if (action == QStringLiteral("get_instruction_trace"))
+    {
+        return this->handleGetInstructionTrace(request);
+    }
+
     if (action == QStringLiteral("configure_event_stream"))
     {
         return const_cast<McpBridgeServer*>(this)->handleConfigureEventStream(request);
@@ -1926,6 +1953,93 @@ QJsonObject McpBridgeServer::handleGetDebugEvents(const QJsonObject& request) co
                           });
 }
 
+QJsonObject McpBridgeServer::handleStartInstructionTrace(const QJsonObject& request) const
+{
+    int maxRecordsValue = request.value(QStringLiteral("max_records")).toInt(static_cast<int>(kDefaultInstructionTraceMaxRecords));
+    if (maxRecordsValue <= 0)
+    {
+        return makeErrorResponse(request, QStringLiteral("Invalid max_records. Expected a positive integer."));
+    }
+
+    const bool clearExisting = request.value(QStringLiteral("clear_existing")).toBool(true);
+    if (!CoreDebuggerStartInstructionTrace(static_cast<uint32_t>(maxRecordsValue), clearExisting))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    CoreDebuggerInstructionTraceStatus status;
+    CoreDebuggerGetInstructionTraceStatus(status);
+    return makeOkResponse(request, instructionTraceStatusToJson(status));
+}
+
+QJsonObject McpBridgeServer::handleStopInstructionTrace(const QJsonObject& request) const
+{
+    if (!CoreDebuggerStopInstructionTrace())
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    CoreDebuggerInstructionTraceStatus status;
+    CoreDebuggerGetInstructionTraceStatus(status);
+    return makeOkResponse(request, instructionTraceStatusToJson(status));
+}
+
+QJsonObject McpBridgeServer::handleClearInstructionTrace(const QJsonObject& request) const
+{
+    if (!CoreDebuggerClearInstructionTrace())
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    CoreDebuggerInstructionTraceStatus status;
+    CoreDebuggerGetInstructionTraceStatus(status);
+    return makeOkResponse(request, instructionTraceStatusToJson(status));
+}
+
+QJsonObject McpBridgeServer::handleGetInstructionTraceStatus(const QJsonObject& request) const
+{
+    CoreDebuggerInstructionTraceStatus status;
+    if (!CoreDebuggerGetInstructionTraceStatus(status))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    return makeOkResponse(request, instructionTraceStatusToJson(status));
+}
+
+QJsonObject McpBridgeServer::handleGetInstructionTrace(const QJsonObject& request) const
+{
+    quint64 startIndex = request.value(QStringLiteral("start_index")).toVariant().toULongLong();
+    int limitValue = request.value(QStringLiteral("limit")).toInt(static_cast<int>(kMaxInstructionTraceResults));
+    if (limitValue <= 0 || limitValue > static_cast<int>(kMaxInstructionTraceResults))
+    {
+        return makeErrorResponse(request,
+                                 QStringLiteral("Invalid limit. Expected 1..%1.")
+                                     .arg(static_cast<int>(kMaxInstructionTraceResults)));
+    }
+
+    std::vector<CoreDebuggerInstructionTraceRecord> records;
+    CoreDebuggerInstructionTraceStatus status;
+    if (!CoreDebuggerGetInstructionTrace(startIndex, static_cast<uint32_t>(limitValue), records, status))
+    {
+        return makeErrorResponse(request, QString::fromStdString(CoreGetError()));
+    }
+
+    QJsonArray payload;
+    for (const CoreDebuggerInstructionTraceRecord& record : records)
+    {
+        payload.append(instructionTraceRecordToJson(record));
+    }
+
+    return makeOkResponse(request,
+                          QJsonObject{
+                              {QStringLiteral("records"), payload},
+                              {QStringLiteral("returned_count"), payload.size()},
+                              {QStringLiteral("next_index"), QString::number(startIndex + static_cast<quint64>(payload.size()))},
+                              {QStringLiteral("status"), instructionTraceStatusToJson(status)},
+                          });
+}
+
 QJsonObject McpBridgeServer::handleConfigureEventStream(const QJsonObject& request)
 {
     QWebSocket* socket = qobject_cast<QWebSocket*>(sender());
@@ -2245,6 +2359,11 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
             snapshotPayload.insert(QStringLiteral("registers"),
                                    QJsonObject{
                                        {QStringLiteral("pc"), u64ToHexString(event.registerSnapshot.pc)},
+                                       {QStringLiteral("zero"), u64ToHexString(event.registerSnapshot.zero)},
+                                       {QStringLiteral("at"), u64ToHexString(event.registerSnapshot.at)},
+                                       {QStringLiteral("hi"), u64ToHexString(event.registerSnapshot.hi)},
+                                       {QStringLiteral("lo"), u64ToHexString(event.registerSnapshot.lo)},
+                                       {QStringLiteral("fp"), u64ToHexString(event.registerSnapshot.fp)},
                                        {QStringLiteral("ra"), u64ToHexString(event.registerSnapshot.ra)},
                                        {QStringLiteral("sp"), u64ToHexString(event.registerSnapshot.sp)},
                                        {QStringLiteral("gp"), u64ToHexString(event.registerSnapshot.gp)},
@@ -2256,8 +2375,24 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
                                        {QStringLiteral("v1"), u64ToHexString(event.registerSnapshot.v1)},
                                        {QStringLiteral("s0"), u64ToHexString(event.registerSnapshot.s0)},
                                        {QStringLiteral("s1"), u64ToHexString(event.registerSnapshot.s1)},
+                                       {QStringLiteral("s2"), u64ToHexString(event.registerSnapshot.s2)},
+                                       {QStringLiteral("s3"), u64ToHexString(event.registerSnapshot.s3)},
+                                       {QStringLiteral("s4"), u64ToHexString(event.registerSnapshot.s4)},
+                                       {QStringLiteral("s5"), u64ToHexString(event.registerSnapshot.s5)},
+                                       {QStringLiteral("s6"), u64ToHexString(event.registerSnapshot.s6)},
+                                       {QStringLiteral("s7"), u64ToHexString(event.registerSnapshot.s7)},
                                        {QStringLiteral("t0"), u64ToHexString(event.registerSnapshot.t0)},
                                        {QStringLiteral("t1"), u64ToHexString(event.registerSnapshot.t1)},
+                                       {QStringLiteral("t2"), u64ToHexString(event.registerSnapshot.t2)},
+                                       {QStringLiteral("t3"), u64ToHexString(event.registerSnapshot.t3)},
+                                       {QStringLiteral("t4"), u64ToHexString(event.registerSnapshot.t4)},
+                                       {QStringLiteral("t5"), u64ToHexString(event.registerSnapshot.t5)},
+                                       {QStringLiteral("t6"), u64ToHexString(event.registerSnapshot.t6)},
+                                       {QStringLiteral("t7"), u64ToHexString(event.registerSnapshot.t7)},
+                                       {QStringLiteral("t8"), u64ToHexString(event.registerSnapshot.t8)},
+                                       {QStringLiteral("t9"), u64ToHexString(event.registerSnapshot.t9)},
+                                       {QStringLiteral("k0"), u64ToHexString(event.registerSnapshot.k0)},
+                                       {QStringLiteral("k1"), u64ToHexString(event.registerSnapshot.k1)},
                                    });
         }
 
@@ -2276,6 +2411,101 @@ QJsonObject McpBridgeServer::eventToJson(const CoreDebuggerEvent& event)
         }
 
         payload.insert(QStringLiteral("snapshot"), snapshotPayload);
+    }
+
+    return payload;
+}
+
+QJsonObject McpBridgeServer::instructionTraceStatusToJson(const CoreDebuggerInstructionTraceStatus& status)
+{
+    return QJsonObject{
+        {QStringLiteral("active"), status.active},
+        {QStringLiteral("truncated"), status.truncated},
+        {QStringLiteral("start_timestamp_us"), QString::number(status.startTimestampUs)},
+        {QStringLiteral("latest_timestamp_us"), QString::number(status.latestTimestampUs)},
+        {QStringLiteral("total_captured"), QString::number(status.totalCaptured)},
+        {QStringLiteral("dropped_records"), QString::number(status.droppedRecords)},
+        {QStringLiteral("buffered_count"), static_cast<int>(status.bufferedCount)},
+        {QStringLiteral("max_records"), static_cast<int>(status.maxRecords)},
+    };
+}
+
+QJsonObject McpBridgeServer::instructionTraceRecordToJson(const CoreDebuggerInstructionTraceRecord& record)
+{
+    CoreDebuggerResolvedSymbol symbol;
+    CoreDebuggerResolveSymbol(record.pc, symbol);
+
+    QJsonObject instructionPayload{
+        {QStringLiteral("word"), u32ToHexString(record.word)},
+    };
+
+    CoreDebuggerInstruction instruction;
+    if (CoreDebuggerDecodeInstruction(record.pc, record.word, instruction))
+    {
+        const QString mnemonic = QString::fromStdString(instruction.mnemonic).trimmed();
+        const QString arguments = QString::fromStdString(instruction.arguments).trimmed();
+        instructionPayload.insert(QStringLiteral("mnemonic"), mnemonic);
+        instructionPayload.insert(QStringLiteral("arguments"), arguments);
+        instructionPayload.insert(QStringLiteral("text"),
+                                  arguments.isEmpty()
+                                      ? mnemonic
+                                      : QStringLiteral("%1 %2").arg(mnemonic, arguments));
+    }
+
+    QJsonArray flags;
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW) != 0)
+    {
+        flags.append(QStringLiteral("control_flow"));
+    }
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_BRANCH) != 0)
+    {
+        flags.append(QStringLiteral("branch"));
+    }
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_CALL) != 0)
+    {
+        flags.append(QStringLiteral("call"));
+    }
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_RETURN) != 0)
+    {
+        flags.append(QStringLiteral("return"));
+    }
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_INDIRECT) != 0)
+    {
+        flags.append(QStringLiteral("indirect"));
+    }
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_CONDITIONAL) != 0)
+    {
+        flags.append(QStringLiteral("conditional"));
+    }
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_LINK) != 0)
+    {
+        flags.append(QStringLiteral("link"));
+    }
+    if ((record.flags & CORE_DEBUGGER_TRACE_FLAG_EXCEPTION_RETURN) != 0)
+    {
+        flags.append(QStringLiteral("eret"));
+    }
+
+    QJsonObject payload{
+        {QStringLiteral("index"), QString::number(record.index)},
+        {QStringLiteral("timestamp_us"), QString::number(record.timestampUs)},
+        {QStringLiteral("pc"), u32ToHexString(record.pc)},
+        {QStringLiteral("symbol"), resolvedSymbolToJson(symbol)},
+        {QStringLiteral("flags_raw"), u32ToHexString(record.flags)},
+        {QStringLiteral("flags"), flags},
+        {QStringLiteral("instruction"), instructionPayload},
+    };
+
+    if (record.hasNextPc)
+    {
+        payload.insert(QStringLiteral("next_pc"), u32ToHexString(record.nextPc));
+    }
+    if (record.hasBranchTarget)
+    {
+        CoreDebuggerResolvedSymbol branchTargetSymbol;
+        CoreDebuggerResolveSymbol(record.branchTarget, branchTargetSymbol);
+        payload.insert(QStringLiteral("branch_target"), u32ToHexString(record.branchTarget));
+        payload.insert(QStringLiteral("branch_target_symbol"), resolvedSymbolToJson(branchTargetSymbol));
     }
 
     return payload;

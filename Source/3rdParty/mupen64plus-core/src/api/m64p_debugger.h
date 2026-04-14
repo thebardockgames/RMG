@@ -63,6 +63,17 @@ typedef m64p_error (*ptr_DebugSetRunState)(m64p_dbg_runstate);
 EXPORT m64p_error CALL DebugSetRunState(m64p_dbg_runstate);
 #endif
 
+/* DebugSetTraceEnabled()
+ *
+ * This function enables or disables continuous debugger UI update callbacks
+ * while the CPU is running. Front-ends can use this to capture instruction
+ * traces without forcing the core into single-step mode.
+ */
+typedef m64p_error (*ptr_DebugSetTraceEnabled)(int);
+#if defined(M64P_CORE_PROTOTYPES)
+EXPORT m64p_error CALL DebugSetTraceEnabled(int);
+#endif
+
 /* DebugGetState()
  *
  * This function reads and returns a debugger state variable, which are

@@ -72,6 +72,11 @@ struct CoreDebuggerEvent
     {
         bool valid = false;
         uint64_t pc = 0;
+        uint64_t zero = 0;
+        uint64_t at = 0;
+        uint64_t hi = 0;
+        uint64_t lo = 0;
+        uint64_t fp = 0;
         uint64_t ra = 0;
         uint64_t sp = 0;
         uint64_t gp = 0;
@@ -83,8 +88,24 @@ struct CoreDebuggerEvent
         uint64_t v1 = 0;
         uint64_t s0 = 0;
         uint64_t s1 = 0;
+        uint64_t s2 = 0;
+        uint64_t s3 = 0;
+        uint64_t s4 = 0;
+        uint64_t s5 = 0;
+        uint64_t s6 = 0;
+        uint64_t s7 = 0;
         uint64_t t0 = 0;
         uint64_t t1 = 0;
+        uint64_t t2 = 0;
+        uint64_t t3 = 0;
+        uint64_t t4 = 0;
+        uint64_t t5 = 0;
+        uint64_t t6 = 0;
+        uint64_t t7 = 0;
+        uint64_t t8 = 0;
+        uint64_t t9 = 0;
+        uint64_t k0 = 0;
+        uint64_t k1 = 0;
     };
 
     struct MemorySnapshot
@@ -114,6 +135,43 @@ struct CoreDebuggerEventStats
 {
     uint64_t latestId = 0;
     uint32_t queuedCount = 0;
+};
+
+enum CoreDebuggerTraceRecordFlags : uint32_t
+{
+    CORE_DEBUGGER_TRACE_FLAG_CONTROL_FLOW = UINT32_C(1) << 0,
+    CORE_DEBUGGER_TRACE_FLAG_BRANCH = UINT32_C(1) << 1,
+    CORE_DEBUGGER_TRACE_FLAG_CALL = UINT32_C(1) << 2,
+    CORE_DEBUGGER_TRACE_FLAG_RETURN = UINT32_C(1) << 3,
+    CORE_DEBUGGER_TRACE_FLAG_INDIRECT = UINT32_C(1) << 4,
+    CORE_DEBUGGER_TRACE_FLAG_CONDITIONAL = UINT32_C(1) << 5,
+    CORE_DEBUGGER_TRACE_FLAG_LINK = UINT32_C(1) << 6,
+    CORE_DEBUGGER_TRACE_FLAG_EXCEPTION_RETURN = UINT32_C(1) << 7,
+};
+
+struct CoreDebuggerInstructionTraceRecord
+{
+    uint64_t index = 0;
+    uint64_t timestampUs = 0;
+    uint32_t pc = 0;
+    uint32_t nextPc = 0;
+    bool hasNextPc = false;
+    uint32_t word = 0;
+    uint32_t branchTarget = 0;
+    bool hasBranchTarget = false;
+    uint32_t flags = 0;
+};
+
+struct CoreDebuggerInstructionTraceStatus
+{
+    bool active = false;
+    bool truncated = false;
+    uint64_t startTimestampUs = 0;
+    uint64_t latestTimestampUs = 0;
+    uint64_t totalCaptured = 0;
+    uint64_t droppedRecords = 0;
+    uint32_t bufferedCount = 0;
+    uint32_t maxRecords = 0;
 };
 
 void CoreDebuggerResetSession(void);
@@ -147,5 +205,13 @@ bool CoreDebuggerGetEvents(uint64_t sinceId,
                            uint32_t limit,
                            std::vector<CoreDebuggerEvent>& events,
                            uint64_t& latestId);
+bool CoreDebuggerStartInstructionTrace(uint32_t maxRecords, bool clearExisting);
+bool CoreDebuggerStopInstructionTrace(void);
+bool CoreDebuggerClearInstructionTrace(void);
+bool CoreDebuggerGetInstructionTraceStatus(CoreDebuggerInstructionTraceStatus& status);
+bool CoreDebuggerGetInstructionTrace(uint64_t startIndex,
+                                     uint32_t limit,
+                                     std::vector<CoreDebuggerInstructionTraceRecord>& records,
+                                     CoreDebuggerInstructionTraceStatus& status);
 
 #endif // CORE_DEBUGGER_HPP
